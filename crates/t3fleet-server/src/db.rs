@@ -2,8 +2,10 @@ use std::{path::Path, sync::Mutex};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use t3fleet_protocol::{DEFAULT_SANDBOX_NAME, SandboxActivity, StatusResponse, WakePolicy};
+use t3fleet_protocol::{SandboxActivity, StatusResponse, WakePolicy};
 use uuid::Uuid;
+
+use crate::{provider::SandboxState, sandbox_alias};
 
 pub struct Db(Mutex<Connection>);
 
@@ -21,9 +23,11 @@ pub struct Sandbox {
     pub preserved_snapshot: Option<String>,
     pub restore_key: Option<String>,
     pub name: String,
-    pub boat_id: String,
+    pub provider_sandbox_id: String,
+    pub provider: String,
+    pub ssh_user: Option<String>,
     pub alias: String,
-    pub state: String,
+    pub state: SandboxState,
     pub bootstrapped_at: Option<DateTime<Utc>>,
     pub last_activity_at: Option<DateTime<Utc>>,
     pub stopped_at: Option<DateTime<Utc>>,
@@ -60,10 +64,18 @@ fn user_row(row: &Row<'_>) -> rusqlite::Result<User> {
 
 const SANDBOX_COLUMNS: &str = "s.id, s.size, s.template, s.preserved_snapshot, s.restore_key,
     s.name, s.boat_sandbox_id, s.ssh_alias, s.state, s.bootstrapped_at, s.last_activity_at,
-    s.stopped_at, s.stopped_reason, s.last_activity_json";
+    s.stopped_at, s.stopped_reason, s.last_activity_json, s.provider, s.ssh_user";
 
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Sandbox> {
     let activity_json: Option<String> = row.get(13)?;
+    let state = match row.get::<_, String>(8)?.as_str() {
+        "starting" => SandboxState::Starting,
+        "running" => SandboxState::Running,
+        "stopping" => SandboxState::Stopping,
+        "stopped" => SandboxState::Stopped,
+        "failed" => SandboxState::Failed,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
     Ok(Sandbox {
         id: row.get(0)?,
         size: row.get(1)?,
@@ -71,9 +83,9 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Sandbox> {
         preserved_snapshot: row.get(3)?,
         restore_key: row.get(4)?,
         name: row.get(5)?,
-        boat_id: row.get(6)?,
+        provider_sandbox_id: row.get(6)?,
         alias: row.get(7)?,
-        state: row.get(8)?,
+        state,
         bootstrapped_at: time_column(row, 9)?,
         last_activity_at: time_column(row, 10)?,
         stopped_at: time_column(row, 11)?,
@@ -81,13 +93,15 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Sandbox> {
         last_activity: activity_json
             .as_deref()
             .and_then(|raw| serde_json::from_str(raw).ok()),
+        provider: row.get(14)?,
+        ssh_user: row.get(15)?,
     })
 }
 
 impl Sandbox {
-    // The reservation keeps an idempotency key even if Boat's create response is lost.
+    // The reservation keeps an idempotency key even if the create response is lost.
     pub fn provisioned(&self) -> bool {
-        !self.boat_id.starts_with("pending:")
+        !self.provider_sandbox_id.starts_with("pending:")
     }
 }
 
@@ -129,11 +143,13 @@ impl Db {
              );",
         )?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for (table, column) in [
-            ("users", "template"),
-            ("sandboxes", "template"),
-            ("sandboxes", "preserved_snapshot"),
-            ("sandboxes", "restore_key"),
+        for (table, column, definition) in [
+            ("users", "template", "TEXT"),
+            ("sandboxes", "template", "TEXT"),
+            ("sandboxes", "preserved_snapshot", "TEXT"),
+            ("sandboxes", "restore_key", "TEXT"),
+            ("sandboxes", "ssh_user", "TEXT"),
+            ("sandboxes", "provider", "TEXT NOT NULL DEFAULT 'boat'"),
         ] {
             let present: bool = tx.query_row(
                 &format!(
@@ -143,7 +159,22 @@ impl Db {
                 |row| row.get(0),
             )?;
             if !present {
-                tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+                tx.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+                if column == "provider" {
+                    tx.execute(
+                        "UPDATE sandboxes SET state = CASE
+                             WHEN state IN ('ready', 'idle', 'running') THEN 'running'
+                             WHEN state IN ('archiving', 'stopping') THEN 'stopping'
+                             WHEN state IN ('archived', 'stopped') THEN 'stopped'
+                             WHEN state IN ('error', 'cancelled', 'failed') THEN 'failed'
+                             ELSE 'starting'
+                         END",
+                        [],
+                    )?;
+                }
             }
         }
         tx.commit()?;
@@ -348,9 +379,7 @@ impl Db {
     }
 
     pub fn watched_sandboxes(&self) -> rusqlite::Result<Vec<(String, Sandbox)>> {
-        self.fleet_sandboxes(
-            "WHERE s.state IN ('ready', 'idle', 'running', 'archived', 'archiving', 'stopping')",
-        )
+        self.fleet_sandboxes("WHERE s.state IN ('running', 'stopped', 'stopping')")
     }
 
     fn fleet_sandboxes(&self, filter: &str) -> rusqlite::Result<Vec<(String, Sandbox)>> {
@@ -361,7 +390,7 @@ impl Db {
                 "SELECT {SANDBOX_COLUMNS}, u.username FROM sandboxes s
                 JOIN users u ON u.id = s.user_id {filter} ORDER BY u.username, s.name"
             ))?
-            .query_map([], |row| Ok((row.get(14)?, sandbox_row(row)?)))?
+            .query_map([], |row| Ok((row.get(16)?, sandbox_row(row)?)))?
             .collect()
     }
 
@@ -371,17 +400,14 @@ impl Db {
         name: &str,
         size: &str,
         template: Option<&str>,
+        provider: &str,
     ) -> rusqlite::Result<Option<Sandbox>> {
         let id = Uuid::new_v4().to_string();
-        let alias = if name == DEFAULT_SANDBOX_NAME {
-            format!("t3fleet-{}", user.username)
-        } else {
-            format!("t3fleet-{}-{name}", user.username)
-        };
+        let alias = sandbox_alias(&user.username, name);
         let created = self.0.lock().unwrap().execute(
             "INSERT INTO sandboxes(id, user_id, name, boat_sandbox_id, ssh_alias, size, state,
-                                   last_activity_at, created_at, updated_at, template)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'provisioning', ?7, ?7, ?7, ?8)
+                                   last_activity_at, created_at, updated_at, template, provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?7, ?7, ?8, ?9)
              ON CONFLICT(ssh_alias) DO NOTHING",
             params![
                 id,
@@ -391,7 +417,8 @@ impl Db {
                 alias,
                 size,
                 timestamp(Utc::now()),
-                template
+                template,
+                provider,
             ],
         )?;
         if created == 0 {
@@ -416,19 +443,20 @@ impl Db {
         self.0.lock().unwrap().execute(
             "UPDATE sandboxes SET state = ?1, bootstrapped_at = ?2, last_activity_at = ?3,
                     stopped_at = ?4, stopped_reason = ?5, last_activity_json = ?6, updated_at = ?7,
-                    boat_sandbox_id = ?8, preserved_snapshot = ?9, restore_key = ?10
-             WHERE id = ?11",
+                    boat_sandbox_id = ?8, preserved_snapshot = ?9, restore_key = ?10, ssh_user = ?11
+             WHERE id = ?12",
             params![
-                sandbox.state,
+                sandbox.state.as_str(),
                 sandbox.bootstrapped_at.map(timestamp),
                 sandbox.last_activity_at.map(timestamp),
                 sandbox.stopped_at.map(timestamp),
                 sandbox.stopped_reason,
                 activity_json,
                 timestamp(Utc::now()),
-                sandbox.boat_id,
+                sandbox.provider_sandbox_id,
                 sandbox.preserved_snapshot,
                 sandbox.restore_key,
+                sandbox.ssh_user,
                 sandbox.id,
             ],
         )?;
@@ -436,13 +464,20 @@ impl Db {
     }
 }
 
-pub fn status(user: &User, sandbox: Option<Sandbox>, wake_policy: WakePolicy) -> StatusResponse {
+pub fn status(
+    user: &User,
+    sandbox: Option<Sandbox>,
+    wake_policy: WakePolicy,
+    ssh_user: String,
+) -> StatusResponse {
     let mut status = StatusResponse {
         username: user.username.clone(),
         sandbox_size: user.size.clone(),
         sandbox_name: None,
         sandbox_id: None,
         ssh_alias: None,
+        ssh_user,
+        provider: None,
         state: None,
         wake_policy,
         last_activity_at: None,
@@ -454,11 +489,12 @@ pub fn status(user: &User, sandbox: Option<Sandbox>, wake_policy: WakePolicy) ->
         usage: None,
     };
     if let Some(sandbox) = sandbox {
-        status.sandbox_id = sandbox.provisioned().then_some(sandbox.boat_id);
+        status.sandbox_id = sandbox.provisioned().then_some(sandbox.provider_sandbox_id);
         status.sandbox_name = Some(sandbox.name);
         status.sandbox_size = sandbox.size;
         status.ssh_alias = Some(sandbox.alias);
-        status.state = Some(sandbox.state);
+        status.provider = Some(sandbox.provider);
+        status.state = Some(sandbox.state.as_str().into());
         status.last_activity_at = sandbox.last_activity_at;
         status.stopped_at = sandbox.stopped_at;
         status.stopped_reason = sandbox.stopped_reason;
@@ -467,4 +503,58 @@ pub fn status(user: &User, sandbox: Option<Sandbox>, wake_policy: WakePolicy) ->
         status.preserved_snapshot = sandbox.preserved_snapshot;
     }
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opens_v0_1_0_database_and_normalizes_legacy_sandboxes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, sandbox_size TEXT NOT NULL,
+                ssh_public_key TEXT, created_at TEXT NOT NULL, template TEXT
+             );
+             CREATE TABLE sandboxes (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name TEXT NOT NULL DEFAULT 'default',
+                boat_sandbox_id TEXT NOT NULL UNIQUE, ssh_alias TEXT NOT NULL UNIQUE,
+                size TEXT NOT NULL, state TEXT NOT NULL, bootstrapped_at TEXT,
+                last_activity_at TEXT, stopped_at TEXT, stopped_reason TEXT,
+                last_activity_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                template TEXT, preserved_snapshot TEXT, restore_key TEXT, UNIQUE (user_id, name)
+             );
+             INSERT INTO users (id, username, sandbox_size, created_at)
+             VALUES ('user-id', 'alice', 'small', '2026-01-01T00:00:00Z');
+             INSERT INTO sandboxes (id, user_id, boat_sandbox_id, ssh_alias, size, state,
+                    stopped_at, stopped_reason, preserved_snapshot, created_at, updated_at)
+             VALUES ('sandbox-id', 'user-id', 'bx_alice', 't3fleet-alice', 'small', 'archived',
+                    '2026-01-01T00:00:00Z', 'manual', 't3fleet-keep-bx-alice',
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            let watched = db.watched_sandboxes().unwrap();
+            let [(owner, sandbox)] = watched.as_slice() else {
+                panic!("expected one watched sandbox");
+            };
+            assert_eq!(owner, "alice");
+            assert_eq!(sandbox.provider, "boat");
+            assert_eq!(sandbox.provider_sandbox_id, "bx_alice");
+            assert_eq!(sandbox.state, SandboxState::Stopped);
+            assert!(sandbox.stopped_at.is_some());
+            assert_eq!(sandbox.stopped_reason.as_deref(), Some("manual"));
+            assert_eq!(
+                sandbox.preserved_snapshot.as_deref(),
+                Some("t3fleet-keep-bx-alice")
+            );
+        }
+    }
 }

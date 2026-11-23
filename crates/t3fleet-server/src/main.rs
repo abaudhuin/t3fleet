@@ -1,9 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use t3fleet_protocol::WakePolicy;
-use t3fleet_server::{App, Settings};
+use t3fleet_server::{App, Settings, provider::ProviderRegistry, providers::boat::BoatProvider};
 use tokio::{net::TcpListener, time::MissedTickBehavior};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -30,6 +30,8 @@ struct Args {
     listen: SocketAddr,
     #[arg(long, env = "T3FLEET_DB", default_value = "./t3fleet.db")]
     db: PathBuf,
+    #[arg(long, env = "T3FLEET_PROVIDER", default_value = BoatProvider::NAME)]
+    provider: String,
     #[arg(long, env = "BOAT_API_KEY", hide_env_values = true)]
     boat_api_key: String,
     #[arg(long, env = "BOAT_ORG")]
@@ -64,22 +66,31 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
+    let mut providers = ProviderRegistry::new(args.provider);
+    providers.register(Arc::new(BoatProvider::new(
+        &args.boat_api_base,
+        &args.boat_api_key,
+        args.boat_org.as_deref(),
+    )?));
     let listener = TcpListener::bind(args.listen).await?;
-    let (app, generated_token) = App::open(Settings {
-        db: args.db,
-        boat_api_key: args.boat_api_key,
-        boat_org: args.boat_org,
-        boat_api_base: args.boat_api_base,
-        admin_token: args.admin_token,
-        idle_timeout: Duration::from_secs(args.idle_timeout_secs),
-        safety_ttl: args.safety_ttl_secs,
-        cooldown: Duration::from_secs(args.auto_wake_cooldown_secs),
-        wake_policy: args.wake_policy.into(),
-        skip_bootstrap: args.skip_bootstrap,
-        max_sandboxes_per_user: args.max_sandboxes_per_user,
-        default_template: args.default_template,
-        snapshot_retention_days: args.snapshot_retention_days,
-    })?;
+    let (app, generated_token) = App::open_with_providers(
+        Settings {
+            db: args.db,
+            boat_api_key: args.boat_api_key,
+            boat_org: args.boat_org,
+            boat_api_base: args.boat_api_base,
+            admin_token: args.admin_token,
+            idle_timeout: Duration::from_secs(args.idle_timeout_secs),
+            safety_ttl: args.safety_ttl_secs,
+            cooldown: Duration::from_secs(args.auto_wake_cooldown_secs),
+            wake_policy: args.wake_policy.into(),
+            skip_bootstrap: args.skip_bootstrap,
+            max_sandboxes_per_user: args.max_sandboxes_per_user,
+            default_template: args.default_template,
+            snapshot_retention_days: args.snapshot_retention_days,
+        },
+        providers,
+    )?;
     if let Some(token) = generated_token {
         eprintln!("Initial t3fleet admin token: {token}");
     }

@@ -160,7 +160,7 @@ pass "Usage reporting, sandbox list, and SSH fragment sync verified against live
 
 log "6. Verifying manual stop, anti-flap passive ssh-proxy rejection, resume, and rotated host-key pinning"
 docker exec "$ALICE_CID" t3fleet stop
-docker exec "$ALICE_CID" t3fleet status --json | jq -e '.state == "archived" and .stopped_reason == "manual"' >/dev/null
+docker exec "$ALICE_CID" t3fleet status --json | jq -e '.state == "stopped" and .stopped_reason == "manual" and .provider == "boat"' >/dev/null
 pass "Alice sandbox manually stopped and archived on Boat"
 
 if docker exec "$ALICE_CID" t3fleet ssh-proxy --config /root/.config/t3fleet/config.toml --alias "t3fleet-$ALICE" </dev/null >/dev/null 2>"$TMPDIR_E2E/proxy_blocked.err"; then
@@ -181,7 +181,7 @@ for i in $(seq 1 18); do
   STATE="$(echo "$ST" | jq -r '.state')"
   REASON="$(echo "$ST" | jq -r '.stopped_reason')"
   echo "  poll #$i: state=$STATE reason=$REASON activity=$(echo "$ST" | jq -c '.activity')"
-  if [ "$STATE" = "archived" ] && [ "$REASON" = "idle" ]; then
+  if [ "$STATE" = "stopped" ] && [ "$REASON" = "idle" ]; then
     STOPPED_IDLE=1
     break
   fi

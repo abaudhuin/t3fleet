@@ -346,6 +346,7 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
     ))
     .await?;
     config::validate_alias(&response.ssh_alias)?;
+    config::validate_ssh_user(&response.ssh_user)?;
     ensure!(
         response.server_t3_port != 0,
         "server returned an invalid T3 Code port"
@@ -355,6 +356,7 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
         username: response.username,
         api_token: response.api_token,
         ssh_alias: response.ssh_alias,
+        ssh_user: response.ssh_user,
         sandbox_id: response.sandbox_id,
         server_t3_port: response.server_t3_port,
         ssh_config,
@@ -362,7 +364,7 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
         known_hosts,
     };
     config.write(&config_path)?;
-    config::write_ssh(&config, &config_path, &config.ssh_alias)?;
+    config::write_ssh(&config, &config_path, &config.ssh_alias, &config.ssh_user)?;
     config::include_ssh(&config)?;
     if let Err(error) = sync_ssh(&config, &config_path).await {
         eprintln!("Could not sync all SSH hosts: {error:#}. Run 't3fleet sync' to retry.");
@@ -427,8 +429,8 @@ async fn sync_ssh(config: &Config, config_path: &Path) -> Result<usize> {
         .iter()
         .map(|status| status_alias(config, status))
         .collect::<Result<Vec<_>>>()?;
-    for alias in &aliases {
-        config::write_ssh(config, config_path, alias)?;
+    for (alias, status) in aliases.iter().zip(&statuses) {
+        config::write_ssh(config, config_path, alias, &status.ssh_user)?;
     }
     config::include_ssh(config)?;
     config::prune_ssh(config, &aliases)?;
@@ -466,7 +468,7 @@ async fn employee_sandbox(
             )
             .await?;
             let alias = status_alias(config, &status)?;
-            config::write_ssh(config, config_path, &alias)?;
+            config::write_ssh(config, config_path, &alias, &status.ssh_user)?;
             println!("SSH host {alias}");
         }
         EmployeeSandboxAction::Rm { name } => {
@@ -692,19 +694,21 @@ async fn proxy(config: &Config, alias: &str) -> Result<()> {
         ),
     )
     .await?;
-    ensure!(ticket.ssh_user == "user", "unexpected Boat SSH user");
+    config::validate_ssh_user(&ticket.ssh_user)?;
     ensure!(
         ticket.port != 0 && valid_ssh_host(&ticket.host),
-        "invalid Boat SSH endpoint"
+        "invalid SSH endpoint"
     );
-    config::pin_host(&config.known_hosts_for(alias)?, alias, &ticket.host_key)?;
+    if let Some(host_key) = &ticket.host_key {
+        config::pin_host(&config.known_hosts_for(alias)?, alias, host_key)?;
+    }
     let socket = tokio::time::timeout(
         Duration::from_secs(20),
         TcpStream::connect((ticket.host.as_str(), ticket.port)),
     )
     .await
-    .context("timed out connecting to Boat SSH endpoint")?
-    .context("connecting to Boat SSH endpoint")?;
+    .context("timed out connecting to SSH endpoint")?
+    .context("connecting to SSH endpoint")?;
     relay(socket).await
 }
 

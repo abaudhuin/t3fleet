@@ -12,28 +12,70 @@ use uuid::Uuid;
 
 use crate::{
     ApiError, App,
-    boat::{RemoteSandbox, ResumeOutcome, SnapshotStatus},
-    db::{self, Sandbox, User},
+    db::{Sandbox, User},
+    provider::{
+        CreateSandboxSpec, GuestUser, RemoteSandbox, ResumeOutcome, SandboxState, SnapshotStatus,
+    },
 };
 
 const WAIT_FOR_T3: &str = r#"timeout 25 sh -c 'until ss -Htl "sport = :3773" 2>/dev/null | grep -q . || curl -sS --max-time 1 -o /dev/null http://127.0.0.1:3773/ 2>/dev/null; do sleep 1; done'"#;
 
 pub(crate) const RETENTION_SNAPSHOT_PREFIX: &str = "t3fleet-keep-";
 
-const BOOTSTRAP: &str = r#"set -eu
-if [ -x /home/user/.local/bin/t3 ] && systemctl is-active --quiet t3code; then
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\"'\"'"))
+}
+
+fn systemd_word(word: &str) -> String {
+    if word
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"_/-.:=".contains(&b))
+    {
+        return word.into();
+    }
+    format!(
+        "\"{}\"",
+        word.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
+}
+
+fn bootstrap_script(guest: &GuestUser) -> Result<String> {
+    ensure!(
+        !guest.username.is_empty()
+            && !guest.username.chars().any(char::is_control)
+            && !guest.username.ends_with('\\'),
+        "invalid guest username for systemd"
+    );
+    let user = shell_quote(&guest.username);
+    let home = shell_quote(&guest.home_dir);
+    let bin = format!("{}/.local/bin", guest.home_dir);
+    let profile = shell_quote(&format!("export PATH={}:\"$PATH\"", shell_quote(&bin)));
+    let service_user = guest.username.replace('%', "%%");
+    let service_home = systemd_word(&format!("HOME={}", guest.home_dir));
+    let service_t3_home = systemd_word(&format!("T3CODE_HOME={}/.t3", guest.home_dir));
+    let service_path = systemd_word(&format!(
+        "PATH={bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ));
+    Ok(format!(
+        r#"set -eu
+guest_user={user}
+guest_home={home}
+if [ -x "$guest_home/.local/bin/t3" ] && systemctl is-active --quiet t3code; then
     exit 0
 fi
-if [ ! -x /home/user/.local/bin/t3 ]; then
-    if [ "$(id -un)" = "user" ]; then
-        env HOME=/home/user bash -o pipefail -c 'curl -fsSL https://t3.codes/install.sh | sh'
+if [ ! -x "$guest_home/.local/bin/t3" ]; then
+    if [ "$(id -un)" = "$guest_user" ]; then
+        env HOME="$guest_home" bash -o pipefail -c 'curl -fsSL https://t3.codes/install.sh | sh'
     else
-        sudo -u user env HOME=/home/user bash -o pipefail -c 'curl -fsSL https://t3.codes/install.sh | sh'
+        sudo -u "$guest_user" -- env HOME="$guest_home" bash -o pipefail -c 'curl -fsSL https://t3.codes/install.sh | sh'
     fi
 fi
-sudo tee /etc/profile.d/t3fleet.sh >/dev/null <<'PROFILE'
-export PATH="/home/user/.local/bin:$PATH"
-PROFILE
+printf '%s\n' {profile} | sudo tee /etc/profile.d/t3fleet.sh >/dev/null
 sudo tee /etc/systemd/system/t3code.service >/dev/null <<'SERVICE'
 [Unit]
 Description=T3 Code
@@ -41,12 +83,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=user
-Environment=HOME=/home/user
-Environment=T3CODE_HOME=/home/user/.t3
-Environment=PATH=/home/user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-WorkingDirectory=/home/user
-ExecStart=/home/user/.local/bin/t3 serve --host 127.0.0.1 --port 3773
+User={service_user}
+Environment={service_home}
+Environment={service_t3_home}
+Environment={service_path}
+ExecStart=:/bin/sh -c 'cd "$HOME" && exec "$HOME/.local/bin/t3" serve --host 127.0.0.1 --port 3773'
 Restart=always
 RestartSec=2
 
@@ -55,7 +96,10 @@ WantedBy=multi-user.target
 SERVICE
 sudo systemctl daemon-reload
 sudo systemctl enable --now t3code
-"#;
+{WAIT_FOR_T3}
+"#
+    ))
+}
 
 const PROBE: &str = r#"set -eu
 ssh_conns=$(ss -Htn state established '( sport = :22 )' 2>/dev/null || true)
@@ -64,11 +108,13 @@ ptys=$(who 2>/dev/null | awk '$2 ~ /^pts\//' || true)
 count_lines() {
     if [ -n "$1" ]; then printf '%s\n' "$1" | wc -l; else printf 0; fi
 }
-python3 - "$(count_lines "$ssh_conns")" "$(count_lines "$t3_http_conns")" "$(count_lines "$ptys")" <<'PY'
+python3 - "$1" "$(count_lines "$ssh_conns")" "$(count_lines "$t3_http_conns")" "$(count_lines "$ptys")" <<'PY'
 import json, os, sqlite3, sys
-ssh_conns, t3_http_conns, interactive_ptys = [int(x) for x in sys.argv[1:4]]
+from pathlib import Path
+userdata = Path(sys.argv[1]) / ".t3" / "userdata"
+ssh_conns, t3_http_conns, interactive_ptys = [int(x) for x in sys.argv[2:5]]
 provider_procs = 0
-pdir = "/home/user/.t3/userdata/provider-processes"
+pdir = userdata / "provider-processes"
 if os.path.isdir(pdir):
     for name in os.listdir(pdir):
         if name.endswith(".json"):
@@ -90,9 +136,9 @@ res = {
     "t3_http_conns": t3_http_conns,
     "latest_t3_activity_at": None,
 }
-db = "/home/user/.t3/userdata/statev2.sqlite"
+db = userdata / "statev2.sqlite"
 if os.path.exists(db):
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    conn = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=2.0)
     try:
         cur = conn.cursor()
         def scalar(q):
@@ -118,6 +164,32 @@ print(json.dumps(res))
 PY
 "#;
 
+fn probe_script(guest: &GuestUser) -> String {
+    format!("set -- {}\n{PROBE}", shell_quote(&guest.home_dir))
+}
+
+fn pairing_command(guest: &GuestUser, base_url: &str, label: &str) -> String {
+    let user = shell_quote(&guest.username);
+    let home = shell_quote(&guest.home_dir);
+    let base_url = shell_quote(base_url);
+    let label = shell_quote(label);
+    format!(
+        r#"set -eu
+guest_user={user}
+guest_home={home}
+sudo systemctl start t3code
+{WAIT_FOR_T3}
+set -- env HOME="$guest_home" "$guest_home/.local/bin/t3" auth pairing create \
+    --base-dir "$guest_home/.t3" --base-url {base_url} --label {label} --ttl '15m' --json
+if [ "$(id -un)" = "$guest_user" ]; then
+    "$@"
+else
+    sudo -u "$guest_user" -- "$@"
+fi
+"#
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Pairing {
@@ -126,8 +198,11 @@ struct Pairing {
     expires_at: chrono::DateTime<Utc>,
 }
 
-fn retention_snapshot_name(boat_id: &str) -> String {
-    format!("{RETENTION_SNAPSHOT_PREFIX}{}", boat_id.replace('_', "-"))
+fn retention_snapshot_name(provider_sandbox_id: &str) -> String {
+    format!(
+        "{RETENTION_SNAPSHOT_PREFIX}{}",
+        provider_sandbox_id.replace('_', "-")
+    )
 }
 
 fn elapsed(time: chrono::DateTime<Utc>) -> Duration {
@@ -136,14 +211,15 @@ fn elapsed(time: chrono::DateTime<Utc>) -> Duration {
 
 impl App {
     async fn sync(&self, sandbox: &mut Sandbox) -> Result<Option<RemoteSandbox>> {
-        let Some(remote) = self.boat.get(&sandbox.boat_id).await? else {
-            ensure!(sandbox.state == "archived", "Boat sandbox not found");
+        let provider = self.provider(sandbox)?;
+        let Some(remote) = provider.get(&sandbox.provider_sandbox_id).await? else {
+            ensure!(sandbox.state.is_stopped(), "provider sandbox not found");
             return Ok(None);
         };
-        if remote.state == "archived" {
+        if remote.state.is_stopped() {
             self.record_stop(sandbox, None, &remote)?;
         } else if sandbox.state != remote.state {
-            sandbox.state.clone_from(&remote.state);
+            sandbox.state = remote.state;
             self.db.save_sandbox(sandbox)?;
         }
         Ok(Some(remote))
@@ -155,7 +231,7 @@ impl App {
         reason: Option<&str>,
         remote: &RemoteSandbox,
     ) -> Result<()> {
-        sandbox.state.clone_from(&remote.state);
+        sandbox.state = remote.state;
         sandbox.stopped_at = Some(
             remote
                 .stopped_at
@@ -172,7 +248,7 @@ impl App {
     }
 
     pub(crate) fn record_activity(&self, sandbox: &mut Sandbox) -> Result<()> {
-        sandbox.state = "running".into();
+        sandbox.state = SandboxState::Running;
         sandbox.last_activity_at = Some(Utc::now());
         sandbox.stopped_at = None;
         sandbox.stopped_reason = None;
@@ -190,10 +266,10 @@ impl App {
         if let Some(sandbox) = sandbox.as_mut().filter(|sandbox| sandbox.provisioned()) {
             self.sync(sandbox).await?;
             if include_usage {
-                usage = self.boat.usage(&sandbox.boat_id).await?;
+                usage = self.sandbox_usage(sandbox).await?;
             }
         }
-        let mut status = db::status(user, sandbox, self.wake_policy);
+        let mut status = self.status(user, sandbox)?;
         status.usage = usage;
         Ok(status)
     }
@@ -206,17 +282,17 @@ impl App {
     ) -> Result<Sandbox, ApiError> {
         let sandbox = match self.db.sandbox(user, name)? {
             Some(sandbox) => sandbox,
-            None if name == DEFAULT_SANDBOX_NAME => self
-                .db
-                .reserve_sandbox(
-                    user,
-                    name,
-                    &user.size,
-                    user.template
-                        .as_deref()
-                        .or(self.default_template.as_deref()),
-                )?
-                .ok_or_else(|| ApiError::conflict("SSH alias is already in use"))?,
+            None if name == DEFAULT_SANDBOX_NAME => {
+                let provider = self.default_provider()?;
+                let template = user
+                    .template
+                    .as_deref()
+                    .or(self.default_template.as_deref());
+                self.validate_provider_template(provider, template)?;
+                self.db
+                    .reserve_sandbox(user, name, &user.size, template, provider.name())?
+                    .ok_or_else(|| ApiError::conflict("SSH alias is already in use"))?
+            }
             None => return Err(ApiError::sandbox_not_found()),
         };
         self.start_sandbox(user, sandbox, intent).await
@@ -228,33 +304,40 @@ impl App {
         mut sandbox: Sandbox,
         intent: WakeIntent,
     ) -> Result<Sandbox, ApiError> {
+        let provider = self.provider(&sandbox)?;
+        let lease_ttl_secs = provider.capabilities().lease_ttl.then_some(self.safety_ttl);
         let mut remote = if sandbox.provisioned() {
             self.sync(&mut sandbox).await?
         } else {
-            let remote = self
-                .boat
-                .create(
-                    &user.username,
-                    &sandbox,
-                    self.safety_ttl,
-                    sandbox.template.as_deref(),
-                    &sandbox.id,
-                )
+            self.validate_provider_template(provider, sandbox.template.as_deref())?;
+            let remote = provider
+                .create(CreateSandboxSpec {
+                    owner: &user.username,
+                    sandbox_name: &sandbox.name,
+                    size: &sandbox.size,
+                    template: sandbox.template.as_deref(),
+                    lease_ttl_secs,
+                    idempotency_key: &sandbox.id,
+                })
                 .await?;
-            sandbox.boat_id.clone_from(&remote.id);
-            sandbox.state.clone_from(&remote.state);
+            sandbox.provider_sandbox_id.clone_from(&remote.id);
+            sandbox.state = remote.state;
             self.db.save_sandbox(&sandbox)?;
             Some(remote)
         };
-        if remote.as_ref().is_some_and(RemoteSandbox::stopping) && sandbox.stopped_reason.is_some()
+        if remote
+            .as_ref()
+            .is_some_and(|remote| remote.state.is_stopping())
         {
-            let archived = self.boat.wait_for(&sandbox.boat_id, true).await?;
-            self.record_stop(&mut sandbox, None, &archived)?;
-            remote = Some(archived);
+            let stopped = provider
+                .wait_for(&sandbox.provider_sandbox_id, true)
+                .await?;
+            self.record_stop(&mut sandbox, None, &stopped)?;
+            remote = Some(stopped);
         }
         if remote
             .as_ref()
-            .is_none_or(|remote| remote.state == "archived")
+            .is_none_or(|remote| remote.state.is_stopped())
         {
             if matches!(intent, WakeIntent::SshProxy) {
                 match self.wake_policy {
@@ -288,19 +371,36 @@ impl App {
                     },
                 }
             }
-            match self.boat.resume(&sandbox.boat_id, self.safety_ttl).await? {
-                ResumeOutcome::Ready(remote) => sandbox.state = remote.state,
+            match provider
+                .resume(&sandbox.provider_sandbox_id, lease_ttl_secs)
+                .await?
+            {
+                ResumeOutcome::Ready(remote) => {
+                    if !remote.state.is_running() {
+                        provider
+                            .wait_for(&sandbox.provider_sandbox_id, false)
+                            .await?;
+                    }
+                }
                 ResumeOutcome::Expired => self.restore(user, &mut sandbox).await?,
             }
-        } else if remote.is_some_and(|remote| !remote.running()) {
-            self.boat.wait_for(&sandbox.boat_id, false).await?;
+        } else if remote.is_some_and(|remote| !remote.state.is_running()) {
+            provider
+                .wait_for(&sandbox.provider_sandbox_id, false)
+                .await?;
         }
 
         self.cleanup_snapshot(&mut sandbox).await?;
 
         if sandbox.bootstrapped_at.is_none() && !self.skip_bootstrap {
-            let command = format!("{BOOTSTRAP}{WAIT_FOR_T3}");
-            self.boat.command(&sandbox.boat_id, &command, 300).await?;
+            let command = bootstrap_script(&provider.guest_user())?;
+            provider
+                .exec(
+                    &sandbox.provider_sandbox_id,
+                    &command,
+                    Duration::from_secs(300),
+                )
+                .await?;
             sandbox.bootstrapped_at = Some(Utc::now());
         }
         self.record_activity(&mut sandbox)?;
@@ -308,20 +408,23 @@ impl App {
     }
 
     async fn restore(&self, user: &User, sandbox: &mut Sandbox) -> Result<()> {
+        let provider = self.provider(sandbox)?;
         let snapshot = sandbox
             .preserved_snapshot
             .as_deref()
-            .filter(|name| *name == retention_snapshot_name(&sandbox.boat_id))
-            .context("Boat's archived sandbox expired without a saved snapshot")?;
+            .filter(|name| {
+                provider.capabilities().snapshot_retention
+                    && *name == retention_snapshot_name(&sandbox.provider_sandbox_id)
+            })
+            .context("stopped sandbox expired without a saved snapshot")?;
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let saved = self
-                    .boat
+                let saved = provider
                     .saved_snapshot(snapshot)
                     .await?
-                    .context("preserved Boat snapshot is missing")?;
+                    .context("preserved snapshot is missing")?;
                 ensure!(
-                    saved.belongs_to(&sandbox.boat_id),
+                    saved.belongs_to(&sandbox.provider_sandbox_id),
                     "saved snapshot belongs to a different sandbox"
                 );
                 ensure!(
@@ -334,7 +437,7 @@ impl App {
                 match saved.status {
                     SnapshotStatus::Ready => return Ok(()),
                     SnapshotStatus::Failed => bail!(
-                        "Boat could not preserve sandbox snapshot: {}",
+                        "could not preserve sandbox snapshot: {}",
                         saved.error.as_deref().unwrap_or("unknown error"),
                     ),
                     SnapshotStatus::Saving => sleep(Duration::from_secs(1)).await,
@@ -342,7 +445,7 @@ impl App {
             }
         })
         .await
-        .context("Boat snapshot is still saving; retry wake shortly")??;
+        .context("snapshot is still saving; retry wake shortly")??;
         let key = match &sandbox.restore_key {
             Some(key) => key.clone(),
             None => {
@@ -352,28 +455,28 @@ impl App {
                 key
             }
         };
-        let restored = self
-            .boat
-            .create(
-                &user.username,
-                sandbox,
-                self.safety_ttl,
-                Some(snapshot),
-                &key,
-            )
+        let restored = provider
+            .create(CreateSandboxSpec {
+                owner: &user.username,
+                sandbox_name: &sandbox.name,
+                size: &sandbox.size,
+                template: Some(snapshot),
+                lease_ttl_secs: provider.capabilities().lease_ttl.then_some(self.safety_ttl),
+                idempotency_key: &key,
+            })
             .await?;
-        let remote = if restored.running() {
+        let remote = if restored.state.is_running() {
             restored
         } else {
-            self.boat.wait_for(&restored.id, false).await?
+            provider.wait_for(&restored.id, false).await?
         };
-        let old_id = std::mem::replace(&mut sandbox.boat_id, remote.id);
+        let old_id = std::mem::replace(&mut sandbox.provider_sandbox_id, remote.id);
         sandbox.state = remote.state;
         sandbox.restore_key = None;
         sandbox.last_activity = None;
         self.db.save_sandbox(sandbox)?;
-        if old_id != sandbox.boat_id
-            && let Err(error) = self.boat.delete(&old_id).await
+        if old_id != sandbox.provider_sandbox_id
+            && let Err(error) = provider.delete(&old_id).await
         {
             tracing::warn!(sandbox_id = %old_id, %error, "could not delete expired sandbox");
         }
@@ -381,8 +484,11 @@ impl App {
     }
 
     async fn cleanup_snapshot(&self, sandbox: &mut Sandbox) -> Result<()> {
-        if let Some(snapshot) = &sandbox.preserved_snapshot {
-            match self.boat.delete_saved_snapshot(snapshot).await {
+        let provider = self.provider(sandbox)?;
+        if provider.capabilities().snapshot_retention
+            && let Some(snapshot) = &sandbox.preserved_snapshot
+        {
+            match provider.delete_saved_snapshot(snapshot).await {
                 Ok(()) => {
                     sandbox.preserved_snapshot = None;
                     sandbox.restore_key = None;
@@ -403,7 +509,7 @@ impl App {
             && self
                 .sync(&mut sandbox)
                 .await?
-                .is_none_or(|remote| remote.state == "archived")
+                .is_none_or(|remote| remote.state.is_stopped())
         {
             return Ok(sandbox);
         }
@@ -418,24 +524,30 @@ impl App {
         let Some(remote) = self.sync(sandbox).await? else {
             return Ok(());
         };
-        if remote.state == "archived" {
+        if remote.state.is_stopped() {
             return self.record_stop(sandbox, Some(reason), &remote);
         }
-        if !remote.stopping() {
-            self.boat.request_stop(&sandbox.boat_id).await?;
+        let provider = self.provider(sandbox)?;
+        if !remote.state.is_stopping() {
+            provider.suspend(&sandbox.provider_sandbox_id).await?;
         }
         sandbox.stopped_reason = Some(reason.into());
         self.db.save_sandbox(sandbox)?;
-        let remote = self.boat.wait_for(&sandbox.boat_id, true).await?;
+        let remote = provider
+            .wait_for(&sandbox.provider_sandbox_id, true)
+            .await?;
         self.record_stop(sandbox, Some(reason), &remote)
     }
 
     pub(crate) async fn delete_sandbox(&self, user: &User, sandbox: Sandbox) -> Result<()> {
-        if let Some(snapshot) = &sandbox.preserved_snapshot {
-            self.boat.delete_saved_snapshot(snapshot).await?;
+        let provider = self.provider(&sandbox)?;
+        if provider.capabilities().snapshot_retention
+            && let Some(snapshot) = &sandbox.preserved_snapshot
+        {
+            provider.delete_saved_snapshot(snapshot).await?;
         }
         if sandbox.provisioned() {
-            self.boat.delete(&sandbox.boat_id).await?;
+            provider.delete(&sandbox.provider_sandbox_id).await?;
         }
         self.db.delete_sandbox(user, &sandbox.name)?;
         Ok(())
@@ -447,18 +559,15 @@ impl App {
         request: PairRequest,
     ) -> Result<PairResponse> {
         let base_url = format!("http://127.0.0.1:{}", request.local_port);
-        let label = request.label.replace('\'', "'\"'\"'");
-        let command = format!(
-            "set -eu\nsudo systemctl start t3code\n{WAIT_FOR_T3}\n\
-             if [ \"$(id -un)\" = \"user\" ]; then\n\
-               env HOME=/home/user /home/user/.local/bin/t3 auth pairing create \
-                 --base-dir /home/user/.t3 --base-url '{base_url}' --label '{label}' --ttl '15m' --json\n\
-             else\n\
-               sudo -u user env HOME=/home/user /home/user/.local/bin/t3 auth pairing create \
-                 --base-dir /home/user/.t3 --base-url '{base_url}' --label '{label}' --ttl '15m' --json\n\
-             fi"
-        );
-        let stdout = self.boat.command(&sandbox.boat_id, &command, 300).await?;
+        let provider = self.provider(sandbox)?;
+        let command = pairing_command(&provider.guest_user(), &base_url, &request.label);
+        let stdout = provider
+            .exec(
+                &sandbox.provider_sandbox_id,
+                &command,
+                Duration::from_secs(300),
+            )
+            .await?;
         let pairing: Pairing = serde_json::from_str(&stdout).context("invalid T3 pairing JSON")?;
         ensure!(
             !pairing.credential.is_empty() && !pairing.pair_url.is_empty(),
@@ -480,15 +589,23 @@ impl App {
 
     pub(crate) async fn watch_sandbox(&self, mut sandbox: Sandbox) -> Result<()> {
         let remote = self.sync(&mut sandbox).await?;
-        if sandbox.state == "archived" {
+        if sandbox.state.is_stopped() {
             return self.preserve_snapshot(&mut sandbox).await;
         }
-        let Some(remote) = remote.filter(RemoteSandbox::running) else {
+        let Some(remote) = remote.filter(|remote| remote.state.is_running()) else {
             return Ok(());
         };
         self.cleanup_snapshot(&mut sandbox).await?;
 
-        let output = self.boat.command(&sandbox.boat_id, PROBE, 15).await?;
+        let provider = self.provider(&sandbox)?;
+        let command = probe_script(&provider.guest_user());
+        let output = provider
+            .exec(
+                &sandbox.provider_sandbox_id,
+                &command,
+                Duration::from_secs(15),
+            )
+            .await?;
         let activity: SandboxActivity =
             serde_json::from_str(&output).context("invalid activity probe output")?;
         if let Some(t3_ts) = activity.latest_t3_activity_at
@@ -505,11 +622,14 @@ impl App {
 
         if actively_working {
             self.record_activity(&mut sandbox)?;
-            if remote
-                .archive_after
-                .is_none_or(|at| at - Utc::now() <= TimeDelta::minutes(30))
+            if provider.capabilities().lease_ttl
+                && remote
+                    .lease_expires_at
+                    .is_none_or(|at| at - Utc::now() <= TimeDelta::minutes(30))
             {
-                self.boat.ttl(&sandbox.boat_id, self.safety_ttl).await?;
+                provider
+                    .extend_lease(&sandbox.provider_sandbox_id, self.safety_ttl)
+                    .await?;
             }
         } else if sandbox
             .last_activity_at
@@ -523,20 +643,22 @@ impl App {
     }
 
     async fn preserve_snapshot(&self, sandbox: &mut Sandbox) -> Result<()> {
+        let provider = self.provider(sandbox)?;
         let retention = self.snapshot_retention_days.saturating_mul(86_400);
-        if retention == 0
+        if !provider.capabilities().snapshot_retention
+            || retention == 0
             || sandbox
                 .stopped_at
                 .is_none_or(|at| elapsed(at).as_secs() < retention)
         {
             return Ok(());
         }
-        let name = retention_snapshot_name(&sandbox.boat_id);
+        let name = retention_snapshot_name(&sandbox.provider_sandbox_id);
         if let Some(existing) = &sandbox.preserved_snapshot
-            && let Some(snapshot) = self.boat.saved_snapshot(existing).await?
+            && let Some(snapshot) = provider.saved_snapshot(existing).await?
         {
             let current = *existing == name
-                && snapshot.belongs_to(&sandbox.boat_id)
+                && snapshot.belongs_to(&sandbox.provider_sandbox_id)
                 && snapshot
                     .created_at
                     .zip(sandbox.stopped_at)
@@ -544,9 +666,11 @@ impl App {
             if current && !matches!(snapshot.status, SnapshotStatus::Failed) {
                 return Ok(());
             }
-            self.boat.delete_saved_snapshot(existing).await?;
+            provider.delete_saved_snapshot(existing).await?;
         }
-        self.boat.save_snapshot(&sandbox.boat_id, &name).await?;
+        provider
+            .save_snapshot(&sandbox.provider_sandbox_id, &name)
+            .await?;
         sandbox.preserved_snapshot = Some(name);
         self.db.save_sandbox(sandbox)?;
         Ok(())

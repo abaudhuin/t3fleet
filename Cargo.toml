@@ -3,7 +3,7 @@ members = ["crates/t3fleet-protocol", "crates/t3fleet-server", "crates/t3fleet-c
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [workspace.dependencies]

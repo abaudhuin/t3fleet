@@ -21,6 +21,7 @@ url = "2"
 toml = "0.8"
 
 [dev-dependencies]
+async-trait = "0.1"
 axum.workspace = true
 chrono.workspace = true
 t3fleet-server.workspace = true
