@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "t3fleet-cli"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "t3fleet-protocol"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "t3fleet-server"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
