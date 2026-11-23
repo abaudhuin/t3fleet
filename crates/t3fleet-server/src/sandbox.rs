@@ -2,10 +2,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{TimeDelta, Utc};
-use serde::Deserialize;
 use t3fleet_protocol::{
-    DEFAULT_SANDBOX_NAME, PairRequest, PairResponse, SandboxActivity, StatusResponse, WakeIntent,
-    WakePolicy,
+    DEFAULT_SANDBOX_NAME, SandboxActivity, StatusResponse, WakeIntent, WakePolicy,
 };
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -185,36 +183,6 @@ PY
 
 fn probe_script(guest: &GuestUser) -> String {
     format!("set -- {}\n{PROBE}", shell_quote(&guest.home_dir))
-}
-
-fn pairing_command(guest: &GuestUser, base_url: &str, label: &str) -> String {
-    let user = shell_quote(&guest.username);
-    let home = shell_quote(&guest.home_dir);
-    let base_url = shell_quote(base_url);
-    let label = shell_quote(label);
-    format!(
-        r#"set -eu
-guest_user={user}
-guest_home={home}
-sudo systemctl start t3code
-{WAIT_FOR_T3}
-set -- env HOME="$guest_home" "$guest_home/.local/bin/t3" auth pairing create \
-    --base-dir "$guest_home/.t3" --base-url {base_url} --label {label} --ttl '15m' --json
-if [ "$(id -un)" = "$guest_user" ]; then
-    "$@"
-else
-    sudo -u "$guest_user" -- "$@"
-fi
-"#
-    )
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Pairing {
-    credential: String,
-    pair_url: String,
-    expires_at: chrono::DateTime<Utc>,
 }
 
 fn retention_snapshot_name(provider_sandbox_id: &str) -> String {
@@ -570,40 +538,6 @@ impl App {
         }
         self.db.delete_sandbox(user, &sandbox.name)?;
         Ok(())
-    }
-
-    pub(crate) async fn pairing(
-        &self,
-        sandbox: &Sandbox,
-        request: PairRequest,
-    ) -> Result<PairResponse> {
-        let base_url = format!("http://127.0.0.1:{}", request.local_port);
-        let provider = self.provider(sandbox)?;
-        let command = pairing_command(&provider.guest_user(), &base_url, &request.label);
-        let stdout = provider
-            .exec(
-                &sandbox.provider_sandbox_id,
-                &command,
-                Duration::from_secs(300),
-            )
-            .await?;
-        let pairing: Pairing = serde_json::from_str(&stdout).context("invalid T3 pairing JSON")?;
-        ensure!(
-            !pairing.credential.is_empty() && !pairing.pair_url.is_empty(),
-            "incomplete T3 pairing response"
-        );
-
-        let mut link = reqwest::Url::parse("t3code://pair")?;
-        link.query_pairs_mut()
-            .append_pair("pairingUrl", &pairing.pair_url);
-        Ok(PairResponse {
-            pair_url: pairing.pair_url,
-            t3_deep_link: link.into(),
-            credential: pairing.credential,
-            expires_at: pairing.expires_at,
-            local_port: request.local_port,
-            ssh_alias: sandbox.alias.clone(),
-        })
     }
 
     pub(crate) async fn watch_sandbox(&self, mut sandbox: Sandbox) -> Result<()> {
