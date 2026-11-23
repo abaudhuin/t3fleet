@@ -2,7 +2,7 @@
 
 Team sandbox management for [T3 Code](https://t3.codes), powered by [boat.dev](https://boat.dev).
 
-`t3fleet` lets a team run isolated cloud sandboxes for every developer using stock T3 Code—no fork, no public HTTP ports, and no paying for idle machines 24/7.
+`t3fleet` lets a team run isolated cloud sandboxes for every developer using stock T3 Code, with no fork, no public HTTP ports, and no paying for idle machines 24/7.
 
 ## Why use t3fleet
 
@@ -14,9 +14,9 @@ Team sandbox management for [T3 Code](https://t3.codes), powered by [boat.dev](h
 - **Central control:** Revoke a device token, stop or wake a sandbox, or check per-sandbox usage from one CLI.
 
 **For developers**
-- **Works with stock T3 Code:** Run `t3fleet join` once—your SSH host is configured automatically and shows up in T3 Code Desktop's SSH environment picker, or you can connect in one step with `t3fleet connect`.
+- **Works with stock T3 Code:** Run `t3fleet join` once. Your SSH host is configured automatically and shows up in T3 Code Desktop's SSH environment picker, or you can connect in one step with `t3fleet connect`.
 - **Agents keep working when you disconnect:** Long-running turns continue in the cloud even if you close your laptop; the sandbox only stops once work finishes and sits idle.
-- **Zero SSH babysitting:** Boat rotates sandbox IPs and host keys on resume—`t3fleet` handles waking the machine and pinning the fresh host key automatically.
+- **Zero SSH babysitting:** Boat rotates sandbox IPs and host keys on resume. `t3fleet` handles waking the machine and pinning the fresh host key automatically.
 - **Optional extra sandboxes:** Spin up a separate box for a branch or experiment (`t3fleet sandbox new billing`) and remove it when done.
 
 ## Install
