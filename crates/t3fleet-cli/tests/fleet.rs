@@ -1123,7 +1123,9 @@ async fn cli_join_installs_ssh_config_and_proxy_pins_key_and_relays_bytes() {
         .arg(&ssh_config);
         cli
     };
-    success(join(cli_invite("create").await).output().await.unwrap());
+    let joined = success(join(cli_invite("create").await).output().await.unwrap());
+    assert!(joined.contains("Add environment > SSH"));
+    assert!(joined.contains("Select t3fleet-alice"));
     let identity = fs::read(dir.join("id_ed25519")).unwrap();
     success(join(cli_invite("invite").await).output().await.unwrap());
     assert_eq!(identity, fs::read(dir.join("id_ed25519")).unwrap());

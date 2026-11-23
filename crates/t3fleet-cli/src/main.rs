@@ -122,8 +122,8 @@ struct Join {
     device_name: Option<String>,
     #[arg(long)]
     allow_insecure_http: bool,
-    /// Only enroll; do not open a tunnel and pair T3 Code Desktop afterwards
-    #[arg(long)]
+    /// Deprecated no-op: `join` no longer opens a tunnel
+    #[arg(long, hide = true)]
     no_connect: bool,
 }
 
@@ -312,7 +312,6 @@ impl Cli {
 }
 
 async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
-    let auto_connect = !args.no_connect && std::io::stdout().is_terminal();
     let api = Api::new(&args.server, args.allow_insecure_http)?;
     let dir = config::absolute(match (args.config_dir, config_path.as_deref()) {
         (Some(dir), _) => dir,
@@ -384,13 +383,19 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
         "Joined as {}. SSH host {}",
         config.username, config.ssh_alias
     );
-    if auto_connect
-        && let Err(error) = connect(&config, DEFAULT_TUNNEL_PORT, false, false, None).await
-    {
-        // Enrollment already succeeded, so a pairing problem must not fail `join`.
-        eprintln!("Could not connect T3 Code: {error:#}. Run 't3fleet connect' to retry.");
-    }
+    println!("{}", t3_setup_steps(&config.ssh_alias));
     Ok(())
+}
+
+fn t3_setup_steps(alias: &str) -> String {
+    format!(
+        "\nFinish in T3 Code Desktop (one time):\n  \
+         1. On the Welcome screen, click Start without an agent\n  \
+         2. Open Settings > Environments > Add environment > SSH\n  \
+         3. Select {alias}, then click Add environment\n  \
+         4. In a new thread, choose your sandbox under Run on\n\n\
+         T3 Code then reconnects and wakes your sandbox by itself. No terminal has to stay open."
+    )
 }
 
 fn employee_request(config: &Config, method: Method, segments: &[&str]) -> Result<RequestBuilder> {
