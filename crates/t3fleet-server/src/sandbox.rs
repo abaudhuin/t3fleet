@@ -141,20 +141,39 @@ if os.path.exists(db):
     conn = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=2.0)
     try:
         cur = conn.cursor()
+        tables = {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        has_legacy = "projection_turns" in tables
+        has_v2 = "orchestration_v2_projection_provider_turns" in tables
+        # Reporting zero work for a schema we cannot read would let the watchdog
+        # stop a running agent, so fail the probe and skip this stop decision.
+        if tables and not (has_legacy or has_v2):
+            sys.exit("unsupported T3 Code database schema")
+        def count(q):
+            return int(cur.execute(q).fetchone()[0])
         def scalar(q):
             try:
                 row = cur.execute(q).fetchone()
                 return row[0] if row and row[0] is not None else None
             except sqlite3.Error:
                 return None
-        res["active_turns"] = int(scalar("SELECT COUNT(*) FROM projection_turns WHERE completed_at IS NULL AND state IN ('queued','starting','running')") or 0)
-        res["active_sessions"] = int(scalar("SELECT COUNT(*) FROM projection_thread_sessions WHERE active_turn_id IS NOT NULL OR status IN ('running','starting','working','waiting')") or 0)
-        res["streaming_messages"] = int(scalar("SELECT COUNT(*) FROM projection_thread_messages WHERE is_streaming = 1") or 0)
-        ts = [
-            scalar("SELECT MAX(updated_at) FROM projection_threads WHERE deleted_at IS NULL"),
-            scalar("SELECT MAX(latest_user_message_at) FROM projection_threads WHERE deleted_at IS NULL"),
-            scalar("SELECT MAX(requested_at) FROM projection_turns"),
-        ]
+        ts = []
+        if has_legacy:
+            res["active_turns"] += count("SELECT COUNT(*) FROM projection_turns WHERE completed_at IS NULL AND state IN ('queued','starting','running')")
+            res["active_sessions"] += count("SELECT COUNT(*) FROM projection_thread_sessions WHERE active_turn_id IS NOT NULL OR status IN ('running','starting','working','waiting')")
+            res["streaming_messages"] += count("SELECT COUNT(*) FROM projection_thread_messages WHERE is_streaming = 1")
+            ts += [
+                scalar("SELECT MAX(updated_at) FROM projection_threads WHERE deleted_at IS NULL"),
+                scalar("SELECT MAX(latest_user_message_at) FROM projection_threads WHERE deleted_at IS NULL"),
+                scalar("SELECT MAX(requested_at) FROM projection_turns"),
+            ]
+        if has_v2:
+            res["active_turns"] += count("SELECT COUNT(*) FROM orchestration_v2_projection_provider_turns WHERE completed_at IS NULL AND status IN ('queued','starting','running')")
+            res["active_sessions"] += count("SELECT COUNT(*) FROM orchestration_v2_projection_provider_sessions WHERE status IN ('starting','running','waiting')")
+            res["streaming_messages"] += count("SELECT COUNT(*) FROM orchestration_v2_projection_messages WHERE streaming = 1")
+            ts += [
+                scalar("SELECT MAX(updated_at) FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL"),
+                scalar("SELECT MAX(started_at) FROM orchestration_v2_projection_provider_turns"),
+            ]
         ts = [t for t in ts if isinstance(t, str) and t]
         if ts:
             res["latest_t3_activity_at"] = max(ts)
@@ -674,5 +693,102 @@ impl App {
         sandbox.preserved_snapshot = Some(name);
         self.db.save_sandbox(sandbox)?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod probe_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::process::{Command, Output};
+    use tempfile::TempDir;
+
+    const V2_SCHEMA: &str = "
+        CREATE TABLE orchestration_v2_projection_provider_turns (
+            provider_turn_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+            started_at TEXT, completed_at TEXT);
+        CREATE TABLE orchestration_v2_projection_provider_sessions (
+            provider_session_id TEXT PRIMARY KEY, status TEXT NOT NULL);
+        CREATE TABLE orchestration_v2_projection_messages (
+            message_id TEXT PRIMARY KEY, streaming INTEGER NOT NULL);
+        CREATE TABLE orchestration_v2_projection_threads (
+            thread_id TEXT PRIMARY KEY, updated_at TEXT NOT NULL, deleted_at TEXT);
+    ";
+
+    fn home_with_db(sql: &str) -> TempDir {
+        let home = TempDir::new().unwrap();
+        let userdata = home.path().join(".t3/userdata");
+        std::fs::create_dir_all(&userdata).unwrap();
+        Connection::open(userdata.join("statev2.sqlite"))
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+        home
+    }
+
+    fn run_probe(home: &TempDir) -> Output {
+        let guest = GuestUser {
+            username: "user".into(),
+            home_dir: home.path().to_str().unwrap().into(),
+        };
+        Command::new("sh")
+            .args(["-c", &probe_script(&guest)])
+            .output()
+            .unwrap()
+    }
+
+    fn activity(home: &TempDir) -> SandboxActivity {
+        let output = run_probe(home);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    #[test]
+    fn probe_reports_running_work_from_v2_tables() {
+        let home = home_with_db(&format!(
+            "{V2_SCHEMA}
+            INSERT INTO orchestration_v2_projection_provider_turns
+                VALUES ('t1', 'running', '2026-11-23T19:00:00.000Z', NULL);
+            INSERT INTO orchestration_v2_projection_provider_sessions VALUES ('s1', 'running');
+            INSERT INTO orchestration_v2_projection_messages VALUES ('m1', 1);
+            INSERT INTO orchestration_v2_projection_threads
+                VALUES ('th1', '2026-11-23T19:00:05.000Z', NULL);"
+        ));
+        let activity = activity(&home);
+        assert_eq!(activity.active_turns, 1);
+        assert_eq!(activity.active_sessions, 1);
+        assert_eq!(activity.streaming_messages, 1);
+        assert_eq!(
+            activity.latest_t3_activity_at.unwrap().to_rfc3339(),
+            "2026-11-23T19:00:05+00:00"
+        );
+    }
+
+    #[test]
+    fn probe_ignores_finished_v2_work() {
+        let home = home_with_db(&format!(
+            "{V2_SCHEMA}
+            INSERT INTO orchestration_v2_projection_provider_turns
+                VALUES ('t1', 'completed', '2026-11-23T19:00:00.000Z', '2026-11-23T19:00:09.000Z');
+            INSERT INTO orchestration_v2_projection_provider_sessions VALUES ('s1', 'ready');
+            INSERT INTO orchestration_v2_projection_messages VALUES ('m1', 0);"
+        ));
+        // Not `has_active_work`, which also counts the test host's login shells.
+        let activity = activity(&home);
+        assert_eq!(activity.active_turns, 0);
+        assert_eq!(activity.active_sessions, 0);
+        assert_eq!(activity.streaming_messages, 0);
+    }
+
+    #[test]
+    fn probe_fails_on_unknown_schema_instead_of_reporting_idle() {
+        let home = home_with_db("CREATE TABLE some_future_table (id TEXT);");
+        let output = run_probe(&home);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported"));
     }
 }

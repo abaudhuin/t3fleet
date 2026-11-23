@@ -71,16 +71,18 @@ t3fleet admin user create alice --size small
 t3fleet join --server https://fleet.example.com --token enr_...
 ```
 
-`join` creates a dedicated SSH keypair, enrolls your machine, and registers your SSH host (`t3fleet-alice`) in `~/.ssh/config`.
+`join` creates a dedicated SSH keypair, enrolls your machine, and registers your SSH host (`t3fleet-alice`) in `~/.ssh/config`. In an interactive terminal it then opens the tunnel and T3 Code Desktop, so the only step left is clicking **Confirm**. Keep that terminal open while connected, or pass `--no-connect` to only enroll.
 
-From there, connect T3 Code either way:
+To connect later, use either route:
 
-- **T3 Code Desktop (SSH):** Open **Settings → Environments → Add environment → SSH** and select `t3fleet-alice`.
 - **One-command tunnel + pairing link:**
   ```sh
   t3fleet connect
   ```
-  Opens a private loopback SSH tunnel (`127.0.0.1:13773` → sandbox `127.0.0.1:3773`) and prints a one-time pairing URL and `t3code://pair` desktop link.
+  Opens a private loopback SSH tunnel (`127.0.0.1:13773` → sandbox `127.0.0.1:3773`), prints a one-time pairing URL, and opens the `t3code://pair` link in T3 Code Desktop (`--no-open` only prints it).
+- **T3 Code Desktop (SSH):** Open **Settings → Environments → Add environment → SSH** and select `t3fleet-alice`. T3 Code manages this connection itself, so no terminal has to stay open.
+
+On Linux, T3 Code Desktop saves connections in the system keyring. A minimal desktop without a Secret Service such as `gnome-keyring` fails with "Could not register connection".
 
 ## Everyday commands
 
@@ -91,7 +93,7 @@ t3fleet status [--sandbox <name>] [--usage] [--json]
 t3fleet ssh [--sandbox <name>] [-- <command>...]
 t3fleet wake [--sandbox <name>]
 t3fleet stop [--sandbox <name>]
-t3fleet connect [--sandbox <name>] [--port 13773] [--no-tunnel]
+t3fleet connect [--sandbox <name>] [--port 13773] [--no-tunnel] [--no-open]
 t3fleet sync                              # refresh local SSH entries for all your sandboxes
 ```
 
@@ -127,7 +129,15 @@ BOAT_API_KEY=boat_... ./scripts/build-template.sh team-base \
   --policy ./policy.json
 ```
 
-Start the server with `--default-template team-base` (or pass `--template team-base` per user or sandbox). Sandboxes created from a snapshot with `t3` already running skip re-installation on boot.
+Start the server with `--default-template team-base` (or pass `--template team-base` per user or sandbox). T3 Code is already installed in the snapshot, so new sandboxes skip re-installation.
+
+`build-template.sh` removes T3 Code's environment ID, signing keys, and database before saving, keeping only `settings.json` and `keybindings.json`, so each sandbox generates its own identity on first boot. **Rebuild templates made with an earlier version**, because their sandboxes share those secrets.
+
+To try T3 Code with no provider login, [`scripts/templates/opencode.sh`](scripts/templates/opencode.sh) enables OpenCode with a free default model:
+
+```sh
+BOAT_API_KEY=boat_... ./scripts/build-template.sh team-base --setup ./scripts/templates/opencode.sh
+```
 
 ## Auto-stop, wake policies & snapshot retention
 
@@ -145,7 +155,7 @@ Choose how aggressively idle boxes stop and wake with `--wake-policy` (`T3FLEET_
 
 - **Private transport & least privilege:** Only `t3fleet-server` holds `BOAT_API_KEY`. Sandboxes are created with `noEnv: true`, T3 Code listens only on loopback (`127.0.0.1:3773`), SSH traffic goes directly from the developer's laptop to their sandbox with strict host-key pinning, and all server tokens are stored as SHA-256 hashes. Plain HTTP is blocked outside loopback and Tailscale unless `--allow-insecure-http` is passed.
 - **Revocation:** `admin user revoke` blocks new API/SSH ticket requests immediately; run `admin sandbox stop <user>` to also terminate an already-open SSH session.
-- **T3 Desktop onboarding & reconnects:** T3 Desktop discovers enrolled SSH hosts automatically, but adding a host still takes one click in **Settings → Environments → Add environment → SSH** (or using `t3fleet connect`). Because OpenSSH cannot distinguish T3 Desktop's background reconnect retries from a manual click, use `--wake-policy aggressive-idle` if your team leaves T3 Desktop open all day.
+- **T3 Desktop onboarding & reconnects:** T3 Desktop discovers enrolled SSH hosts automatically, but adding a host still takes one click in **Settings → Environments → Add environment → SSH** (or one **Confirm** click with `t3fleet connect`). Because OpenSSH cannot distinguish T3 Desktop's background reconnect retries from a manual click, use `--wake-policy aggressive-idle` if your team leaves T3 Desktop open all day.
 - **Provider logins:** Coding agent providers (`claude`, `codex`, etc.) are authenticated inside each sandbox or configured via your template/policy, same as any remote T3 Code host.
 
 ## Providers & development

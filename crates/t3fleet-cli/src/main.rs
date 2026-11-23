@@ -2,6 +2,7 @@ mod api;
 mod config;
 
 use std::{
+    io::IsTerminal,
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     pin::Pin,
@@ -28,6 +29,8 @@ use tokio::{
     sync::oneshot,
     time::{Instant, sleep},
 };
+
+const DEFAULT_TUNNEL_PORT: u16 = 13773;
 
 #[derive(Parser)]
 #[command(version, about = "Manage and connect to your T3 Code sandbox")]
@@ -64,10 +67,13 @@ enum Action {
         command: Vec<String>,
     },
     Connect {
-        #[arg(long, default_value_t = 13773, value_parser = clap::value_parser!(u16).range(1..))]
+        #[arg(long, default_value_t = DEFAULT_TUNNEL_PORT, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
         #[arg(long)]
         no_tunnel: bool,
+        /// Print the pairing link without opening T3 Code Desktop
+        #[arg(long)]
+        no_open: bool,
         #[arg(long)]
         sandbox: Option<String>,
     },
@@ -116,6 +122,9 @@ struct Join {
     device_name: Option<String>,
     #[arg(long)]
     allow_insecure_http: bool,
+    /// Only enroll; do not open a tunnel and pair T3 Code Desktop afterwards
+    #[arg(long)]
+    no_connect: bool,
 }
 
 #[derive(Args)]
@@ -272,9 +281,10 @@ impl Cli {
             Action::Connect {
                 port,
                 no_tunnel,
+                no_open,
                 sandbox,
             } => {
-                connect(&config, port, no_tunnel, sandbox).await?;
+                connect(&config, port, no_tunnel, no_open, sandbox).await?;
             }
             Action::Status {
                 json,
@@ -302,6 +312,7 @@ impl Cli {
 }
 
 async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
+    let auto_connect = !args.no_connect && std::io::stdout().is_terminal();
     let api = Api::new(&args.server, args.allow_insecure_http)?;
     let dir = config::absolute(match (args.config_dir, config_path.as_deref()) {
         (Some(dir), _) => dir,
@@ -373,6 +384,12 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
         "Joined as {}. SSH host {}",
         config.username, config.ssh_alias
     );
+    if auto_connect
+        && let Err(error) = connect(&config, DEFAULT_TUNNEL_PORT, false, false, None).await
+    {
+        // Enrollment already succeeded, so a pairing problem must not fail `join`.
+        eprintln!("Could not connect T3 Code: {error:#}. Run 't3fleet connect' to retry.");
+    }
     Ok(())
 }
 
@@ -778,6 +795,7 @@ async fn connect(
     config: &Config,
     port: u16,
     no_tunnel: bool,
+    no_open: bool,
     sandbox: Option<String>,
 ) -> Result<()> {
     let alias = config.alias(sandbox.as_deref())?;
@@ -835,6 +853,9 @@ async fn connect(
         "Pair in T3 Code using this URL\n{}\nOpen in T3 Code Desktop\n{}",
         response.pair_url, response.t3_deep_link
     );
+    if !no_open && std::io::stdout().is_terminal() && open_pairing_link(&response.t3_deep_link) {
+        println!("Opening T3 Code Desktop. Click Confirm to add this sandbox.");
+    }
     println!("Keep this terminal open while connected. Press Ctrl+C to close the tunnel.");
     tokio::select! {
         result = &mut shutdown => { result?; child.kill().await?; }
@@ -844,6 +865,49 @@ async fn connect(
         }
     }
     Ok(())
+}
+
+/// Hands a `t3code://pair` link to the OS. Returns whether a handler was launched.
+fn open_pairing_link(link: &str) -> bool {
+    // The link comes from the server, so never pass any other URL to the OS opener.
+    if !link.starts_with("t3code://pair?") {
+        return false;
+    }
+    let Some(mut opener) = link_opener(link) else {
+        return false;
+    };
+    opener
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn link_opener(link: &str) -> Option<Command> {
+    let mut command = Command::new("open");
+    command.arg(link);
+    Some(command)
+}
+
+#[cfg(windows)]
+fn link_opener(link: &str) -> Option<Command> {
+    // Unlike `cmd /c start`, this does not reinterpret `&` in the URL.
+    let mut command = Command::new("rundll32");
+    command.args(["url.dll,FileProtocolHandler", link]);
+    Some(command)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn link_opener(link: &str) -> Option<Command> {
+    // Headless hosts have no desktop app to open.
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return None;
+    }
+    let mut command = Command::new("xdg-open");
+    command.arg(link);
+    Some(command)
 }
 
 async fn shutdown_signal() -> Result<()> {

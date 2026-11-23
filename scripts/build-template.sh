@@ -146,6 +146,16 @@ if [ -n "$SETUP_SCRIPT" ]; then
   run_cmd "set -eu; tmp=\$(mktemp); printf '%s' '${SETUP_B64}' | base64 -d > \"\$tmp\"; chmod +x \"\$tmp\"; bash \"\$tmp\"; rm -f \"\$tmp\"" 600
 fi
 
+# A snapshot must not carry T3 Code's identity: every sandbox restored from it
+# would share one environment ID and the same server signing keys.
+echo "==> Removing T3 Code identity and runtime state from the template"
+run_cmd 'set -eu
+sudo systemctl stop t3code
+sudo find /home/user/.t3/userdata -mindepth 1 -maxdepth 1 ! -name settings.json ! -name keybindings.json -exec rm -rf {} +
+sudo systemctl enable t3code >/dev/null 2>&1
+sync
+' 60
+
 echo "==> Saving Boat saved snapshot '${TEMPLATE_NAME}'"
 SAVE_BODY="$(jq -nc --arg id "$SANDBOX_ID" --arg name "$TEMPLATE_NAME" '{sandboxId: $id, name: $name}')"
 curl -fsS -X POST "${API_BASE}/saved-snapshots" "${HEADERS[@]}" -d "$SAVE_BODY" >/dev/null
