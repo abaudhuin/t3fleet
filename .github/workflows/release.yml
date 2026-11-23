@@ -28,11 +28,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
             bins: "t3fleet t3fleet-server"
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
             bins: "t3fleet t3fleet-server"
-          - os: macos-14
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
             bins: "t3fleet t3fleet-server"
