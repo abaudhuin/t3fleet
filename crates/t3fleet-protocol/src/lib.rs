@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 pub const T3_PORT: u16 = 3773;
 pub const DEFAULT_SANDBOX_NAME: &str = "default";
 
+pub fn default_ssh_user() -> String {
+    "user".into()
+}
+
 pub fn valid_sandbox_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name.as_bytes()[0].is_ascii_alphanumeric()
@@ -80,6 +84,8 @@ pub struct EnrollResponse {
     pub username: String,
     pub api_token: String,
     pub ssh_alias: String,
+    #[serde(default = "default_ssh_user")]
+    pub ssh_user: String,
     pub sandbox_id: String,
     pub server_t3_port: u16,
 }
@@ -158,6 +164,8 @@ pub struct SandboxUsage {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AdminUsageEntry {
     pub username: String,
+    #[serde(default)]
+    pub provider: Option<String>,
     pub sandbox_name: String,
     pub sandbox_id: String,
     pub state: String,
@@ -167,6 +175,10 @@ pub struct AdminUsageEntry {
 #[derive(Deserialize, Serialize)]
 pub struct StatusResponse {
     pub username: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default = "default_ssh_user")]
+    pub ssh_user: String,
     pub sandbox_size: String,
     #[serde(default)]
     pub sandbox_name: Option<String>,
@@ -207,7 +219,7 @@ pub struct SshTicketRequest {
 pub struct SshTicketResponse {
     pub host: String,
     pub port: u16,
-    pub host_key: String,
+    pub host_key: Option<String>,
     pub ssh_user: String,
     pub sandbox_id: String,
 }

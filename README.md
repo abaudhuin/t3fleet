@@ -18,7 +18,7 @@ It is an early, intentionally bare-bones tool aimed at small engineering teams (
   └──────────────────────────┘       host key pinned from Boat API on connect       └──────────────────────────────┘
 ```
 
-- **Server (`t3fleet-server`):** Axum + bundled SQLite. Holds `BOAT_API_KEY`, provisions `noEnv: true` Boat sandboxes, manages single-use onboarding invites and revocable per-device tokens, runs the idle-stop watchdog, and preserves stopped disks before Boat's 14-day retention window.
+- **Server (`t3fleet-server`):** Axum + bundled SQLite. Talks to sandboxes through a pluggable `SandboxProvider` trait (currently implementing `boat.dev`; see [docs/providers.md](docs/providers.md)). Holds `BOAT_API_KEY`, provisions `noEnv: true` Boat sandboxes, manages single-use onboarding invites and revocable per-device tokens, runs the idle-stop watchdog, and preserves stopped disks before Boat's 14-day retention window.
 - **CLI (`t3fleet`):** Used by both admins and employees. Enrolls a device, manages OpenSSH config fragments, acts as the OpenSSH `ProxyCommand` (waking the sandbox and pinning its fresh Boat host key before relaying raw TCP), and can open a local loopback tunnel + one-time T3 pairing link.
 - **T3 Code stays untouched:** Inside each sandbox, `t3 serve --host 127.0.0.1 --port 3773` runs under `systemd` as `user`. Nothing is exposed on a public HTTP port.
 
@@ -168,8 +168,10 @@ The watchdog (`--watch-interval-secs`, default `60`) probes running sandboxes ov
 ```text
 crates/
   t3fleet-protocol/   Shared HTTP request/response types
-  t3fleet-server/     Axum + SQLite control plane, Boat v1 client, watchdog
+  t3fleet-server/     Axum + SQLite control plane, SandboxProvider trait, Boat adapter, watchdog
   t3fleet-cli/        Cross-platform CLI (employee + admin + SSH ProxyCommand)
+docs/
+  providers.md        SandboxProvider trait contract and capability model
 scripts/
   build-template.sh   Build and save a reusable Boat saved snapshot
   live-e2e.sh         Live end-to-end test against boat.dev + isolated Docker clients

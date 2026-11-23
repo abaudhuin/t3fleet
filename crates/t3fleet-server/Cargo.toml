@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait = "0.1"
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -21,3 +22,6 @@ subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile.workspace = true

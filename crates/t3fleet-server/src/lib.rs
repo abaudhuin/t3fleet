@@ -1,5 +1,6 @@
-mod boat;
 mod db;
+pub mod provider;
+pub mod providers;
 mod sandbox;
 
 use std::{hash, path::PathBuf, sync::Arc, time::Duration};
@@ -12,9 +13,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use boat::Boat;
 use chrono::{TimeDelta, Utc};
 use db::{Db, Sandbox, User};
+use provider::{ProviderRegistry, SandboxProvider};
+use providers::boat::BoatProvider;
 use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -41,7 +43,7 @@ pub struct Settings {
 
 pub struct App {
     db: Db,
-    boat: Boat,
+    providers: ProviderRegistry,
     admin_hash: String,
     user_locks: [Mutex<()>; 64],
     idle_timeout: Duration,
@@ -168,6 +170,14 @@ fn validate_username(username: &str) -> Result<(), ApiError> {
     }
 }
 
+fn sandbox_alias(owner: &str, name: &str) -> String {
+    if name == DEFAULT_SANDBOX_NAME {
+        format!("t3fleet-{owner}")
+    } else {
+        format!("t3fleet-{owner}-{name}")
+    }
+}
+
 fn sandbox_name(name: Option<&str>) -> Result<&str, ApiError> {
     let name = name.unwrap_or(DEFAULT_SANDBOX_NAME);
     if !valid_sandbox_name(name) {
@@ -212,6 +222,21 @@ fn expiry(ttl: u64) -> Result<chrono::DateTime<Utc>, ApiError> {
 impl App {
     /// Returns the generated admin token only when initializing a new database.
     pub fn open(settings: Settings) -> anyhow::Result<(Arc<Self>, Option<String>)> {
+        let mut providers = ProviderRegistry::new(BoatProvider::NAME);
+        providers.register(Arc::new(BoatProvider::new(
+            &settings.boat_api_base,
+            &settings.boat_api_key,
+            settings.boat_org.as_deref(),
+        )?));
+        Self::open_with_providers(settings, providers)
+    }
+
+    /// Opens the control plane with an explicitly configured provider registry.
+    pub fn open_with_providers(
+        settings: Settings,
+        providers: ProviderRegistry,
+    ) -> anyhow::Result<(Arc<Self>, Option<String>)> {
+        let default = providers.get(providers.default_provider())?;
         ensure!(settings.safety_ttl > 0, "safety TTL must be positive");
         ensure!(
             settings.max_sandboxes_per_user > 0,
@@ -224,11 +249,11 @@ impl App {
                 .is_none_or(valid_template),
             "invalid or reserved default template name"
         );
-        let boat = Boat::new(
-            &settings.boat_api_base,
-            &settings.boat_api_key,
-            settings.boat_org.as_deref(),
-        )?;
+        ensure!(
+            settings.default_template.is_none() || default.capabilities().templates,
+            "default sandbox provider '{}' does not support templates",
+            default.name()
+        );
         let db = Db::open(&settings.db).context("opening fleet database")?;
         let provided = settings.admin_token;
         ensure!(
@@ -243,7 +268,7 @@ impl App {
         Ok((
             Arc::new(Self {
                 db,
-                boat,
+                providers,
                 admin_hash,
                 user_locks: std::array::from_fn(|_| Mutex::new(())),
                 idle_timeout: settings.idle_timeout,
@@ -257,6 +282,51 @@ impl App {
             }),
             (fresh && provided.is_none()).then_some(candidate),
         ))
+    }
+
+    fn provider(&self, sandbox: &Sandbox) -> anyhow::Result<&dyn SandboxProvider> {
+        Ok(self.providers.get(&sandbox.provider)?.as_ref())
+    }
+
+    fn default_provider(&self) -> anyhow::Result<&dyn SandboxProvider> {
+        Ok(self
+            .providers
+            .get(self.providers.default_provider())?
+            .as_ref())
+    }
+
+    fn validate_provider_template(
+        &self,
+        provider: &dyn SandboxProvider,
+        template: Option<&str>,
+    ) -> Result<(), ApiError> {
+        if template.is_some() && !provider.capabilities().templates {
+            return Err(ApiError::bad(&format!(
+                "Sandbox provider '{}' does not support templates",
+                provider.name()
+            )));
+        }
+        Ok(())
+    }
+
+    fn status(&self, user: &User, sandbox: Option<Sandbox>) -> anyhow::Result<StatusResponse> {
+        let ssh_user = match &sandbox {
+            Some(sandbox) => match &sandbox.ssh_user {
+                Some(ssh_user) => ssh_user.clone(),
+                None => self.provider(sandbox)?.guest_user().username,
+            },
+            None => self.default_provider()?.guest_user().username,
+        };
+        Ok(db::status(user, sandbox, self.wake_policy, ssh_user))
+    }
+
+    async fn sandbox_usage(&self, sandbox: &Sandbox) -> anyhow::Result<Option<SandboxUsage>> {
+        let provider = self.provider(sandbox)?;
+        if provider.capabilities().usage_reporting {
+            provider.usage(&sandbox.provider_sandbox_id).await
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -356,7 +426,7 @@ impl App {
             .db
             .sandbox(user, DEFAULT_SANDBOX_NAME)?
             .filter(Sandbox::provisioned)
-            .map(|sandbox| sandbox.boat_id);
+            .map(|sandbox| sandbox.provider_sandbox_id);
         let enrollment_token = token("enr");
         self.db
             .invite(user, &token_hash(&enrollment_token), expires_at)?;
@@ -373,12 +443,12 @@ impl App {
         if let Some(sandbox) = sandbox.as_mut() {
             self.stop(sandbox, "manual").await?;
         }
-        Ok(Json(db::status(&user, sandbox, self.wake_policy)))
+        Ok(Json(self.status(&user, sandbox)?))
     }
 
     async fn wake_user(&self, user: User, name: &str) -> ApiResult<StatusResponse> {
         let sandbox = self.ready(&user, name, WakeIntent::Explicit).await?;
-        Ok(Json(db::status(&user, Some(sandbox), self.wake_policy)))
+        Ok(Json(self.status(&user, Some(sandbox))?))
     }
 }
 
@@ -397,6 +467,7 @@ async fn create_user(
     app.require_admin(&headers)?;
     validate_username(&request.username)?;
     validate_template(request.template.as_deref())?;
+    app.validate_provider_template(app.default_provider()?, request.template.as_deref())?;
     expiry(request.invite_ttl_secs)?;
     let _guard = app.lock_user(&request.username).await;
     if app.db.user(&request.username)?.is_some() {
@@ -425,9 +496,9 @@ async fn list_users(
         .into_iter()
         .map(|user| {
             let sandbox = app.db.sandbox(&user, DEFAULT_SANDBOX_NAME)?;
-            Ok(db::status(&user, sandbox, app.wake_policy))
+            app.status(&user, sandbox)
         })
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(Json(users))
 }
 
@@ -502,13 +573,14 @@ async fn admin_usage(
     let mut entries = Vec::new();
     for (username, sandbox) in app.db.all_sandboxes()? {
         if sandbox.provisioned()
-            && let Some(usage) = app.boat.usage(&sandbox.boat_id).await?
+            && let Some(usage) = app.sandbox_usage(&sandbox).await?
         {
             entries.push(AdminUsageEntry {
                 username,
                 sandbox_name: sandbox.name,
-                sandbox_id: sandbox.boat_id,
-                state: sandbox.state,
+                sandbox_id: sandbox.provider_sandbox_id,
+                provider: Some(sandbox.provider),
+                state: sandbox.state.as_str().into(),
                 usage,
             });
         }
@@ -533,15 +605,23 @@ async fn enroll(
     if app.db.enrollment_user(&hash)?.is_none() {
         return Err(ApiError::unauthorized());
     }
-    let sandbox = app.prepare_enrollment(&user).await?;
+    let mut sandbox = app.prepare_enrollment(&user).await?;
     if !app.db.claim_enrollment(&user, &hash)? {
         return Err(ApiError::unauthorized());
     }
-    if sandbox.state != "archived" {
-        app.boat
-            .authorize_key(&sandbox.boat_id, &request.ssh_public_key)
+    let provider = app.provider(&sandbox)?;
+    let ssh_user = if sandbox.state.is_stopped() {
+        sandbox
+            .ssh_user
+            .unwrap_or_else(|| provider.guest_user().username)
+    } else {
+        let access = provider
+            .authorize_ssh(&sandbox.provider_sandbox_id, &request.ssh_public_key)
             .await?;
-    }
+        sandbox.ssh_user = Some(access.ssh_user.clone());
+        app.db.save_sandbox(&sandbox)?;
+        access.ssh_user
+    };
     let api_token = token("usr");
     app.db.finish_enrollment(
         &user,
@@ -553,7 +633,8 @@ async fn enroll(
         username: user.username,
         api_token,
         ssh_alias: sandbox.alias,
-        sandbox_id: sandbox.boat_id,
+        sandbox_id: sandbox.provider_sandbox_id,
+        ssh_user,
         server_t3_port: T3_PORT,
     }))
 }
@@ -602,7 +683,7 @@ async fn list_sandboxes(
         let status = if query.include_usage {
             app.sandbox_status(&user, Some(sandbox), true).await?
         } else {
-            db::status(&user, Some(sandbox), app.wake_policy)
+            app.status(&user, Some(sandbox))?
         };
         statuses.push(status);
     }
@@ -627,7 +708,13 @@ async fn create_sandbox(
         .template
         .as_deref()
         .or(app.default_template.as_deref());
-    let sandbox = if let Some(existing) = app.db.sandbox(&user, name)? {
+    let existing = app.db.sandbox(&user, name)?;
+    let provider = match &existing {
+        Some(sandbox) => app.provider(sandbox)?,
+        None => app.default_provider()?,
+    };
+    app.validate_provider_template(provider, template)?;
+    let sandbox = if let Some(existing) = existing {
         if existing.provisioned()
             || existing.size != size
             || existing.template.as_deref() != template
@@ -640,13 +727,19 @@ async fn create_sandbox(
             return Err(ApiError::conflict("Sandbox limit reached"));
         }
         app.db
-            .reserve_sandbox(&user, name, size, template)?
+            .reserve_sandbox(
+                &user,
+                name,
+                size,
+                template,
+                app.providers.default_provider(),
+            )?
             .ok_or_else(|| ApiError::conflict("SSH alias is already in use"))?
     };
     let sandbox = app
         .start_sandbox(&user, sandbox, WakeIntent::Explicit)
         .await?;
-    Ok(Json(db::status(&user, Some(sandbox), app.wake_policy)))
+    Ok(Json(app.status(&user, Some(sandbox))?))
 }
 
 async fn remove_sandbox(
@@ -681,12 +774,19 @@ async fn ssh_ticket(
             request.intent,
         )
         .await?;
-    let response = app
-        .boat
-        .authorize_key(&sandbox.boat_id, &request.ssh_public_key)
+    let access = app
+        .provider(&sandbox)?
+        .authorize_ssh(&sandbox.provider_sandbox_id, &request.ssh_public_key)
         .await?;
+    sandbox.ssh_user = Some(access.ssh_user.clone());
     app.record_activity(&mut sandbox)?;
-    Ok(Json(response))
+    Ok(Json(SshTicketResponse {
+        host: access.host,
+        port: access.port,
+        ssh_user: access.ssh_user,
+        host_key: access.host_key,
+        sandbox_id: access.sandbox_id,
+    }))
 }
 
 async fn pair(

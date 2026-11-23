@@ -1,14 +1,21 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url, header};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use t3fleet_protocol::{SandboxUsage, SshTicketResponse};
+use t3fleet_protocol::SandboxUsage;
 use tokio::time::{Instant, sleep};
 
-use crate::db::Sandbox;
+use crate::{
+    provider::{
+        CreateSandboxSpec, GuestUser, ProviderCapabilities, RemoteSandbox, ResumeOutcome,
+        SandboxProvider, SandboxState, SavedSnapshot, SnapshotStatus, SshAccess,
+    },
+    sandbox_alias,
+};
 
 const TRANSIENT_SSH_ERRORS: &[&str] = &[
     "sandbox_restoring",
@@ -17,59 +24,53 @@ const TRANSIENT_SSH_ERRORS: &[&str] = &[
     "machine_not_running",
 ];
 
-pub struct Boat {
+pub struct BoatProvider {
     http: Client,
     base: Url,
 }
 
 #[derive(Deserialize)]
-pub struct RemoteSandbox {
-    pub id: String,
-    pub state: String,
-    #[serde(default)]
-    pub error: Option<String>,
+struct BoatSandbox {
+    id: String,
+    state: String,
+    error: Option<String>,
     #[serde(rename = "archiveAfter")]
-    pub archive_after: Option<DateTime<Utc>>,
+    archive_after: Option<DateTime<Utc>>,
     #[serde(rename = "stoppedAt")]
-    pub stopped_at: Option<DateTime<Utc>>,
+    stopped_at: Option<DateTime<Utc>>,
 }
 
-impl RemoteSandbox {
-    pub fn running(&self) -> bool {
-        matches!(self.state.as_str(), "ready" | "idle" | "running")
+impl From<BoatSandbox> for RemoteSandbox {
+    fn from(sandbox: BoatSandbox) -> Self {
+        Self {
+            id: sandbox.id,
+            state: match sandbox.state.as_str() {
+                "ready" | "idle" | "running" => SandboxState::Running,
+                "archiving" | "stopping" => SandboxState::Stopping,
+                "archived" => SandboxState::Stopped,
+                "error" | "cancelled" => SandboxState::Failed,
+                _ => SandboxState::Starting,
+            },
+            error: sandbox.error,
+            lease_expires_at: sandbox.archive_after,
+            stopped_at: sandbox.stopped_at,
+        }
     }
-
-    pub fn stopping(&self) -> bool {
-        matches!(self.state.as_str(), "archiving" | "stopping")
-    }
-}
-
-pub enum ResumeOutcome {
-    Ready(RemoteSandbox),
-    Expired,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SavedSnapshot {
+struct BoatSnapshot {
     name: String,
-    pub status: SnapshotStatus,
-    pub error: Option<String>,
+    status: BoatSnapshotStatus,
+    error: Option<String>,
     source_sandbox_id: Option<String>,
-    pub created_at: Option<DateTime<Utc>>,
-}
-
-impl SavedSnapshot {
-    pub fn belongs_to(&self, id: &str) -> bool {
-        self.source_sandbox_id
-            .as_deref()
-            .is_none_or(|source| source == id)
-    }
+    created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SnapshotStatus {
+enum BoatSnapshotStatus {
     Saving,
     Ready,
     Failed,
@@ -78,7 +79,7 @@ pub enum SnapshotStatus {
 #[derive(Deserialize)]
 struct SnapshotResponse {
     ok: bool,
-    snapshot: SavedSnapshot,
+    snapshot: BoatSnapshot,
 }
 
 #[derive(Deserialize)]
@@ -95,7 +96,7 @@ struct UsageResponse {
 #[derive(Deserialize)]
 struct SandboxResponse {
     ok: bool,
-    sandbox: RemoteSandbox,
+    sandbox: BoatSandbox,
 }
 
 #[derive(Deserialize)]
@@ -126,7 +127,9 @@ struct CommandResponse {
     timed_out: bool,
 }
 
-impl Boat {
+impl BoatProvider {
+    pub const NAME: &str = "boat";
+
     pub fn new(base: &str, key: &str, org: Option<&str>) -> Result<Self> {
         let base = Url::parse(base.trim_end_matches('/')).context("invalid Boat API base URL")?;
         ensure!(
@@ -179,28 +182,47 @@ impl Boat {
             .await
             .with_context(|| format!("invalid Boat {operation} response"))
     }
+}
 
-    pub async fn create(
-        &self,
-        username: &str,
-        sandbox: &Sandbox,
-        ttl: u64,
-        template: Option<&str>,
-        idempotency_key: &str,
-    ) -> Result<RemoteSandbox> {
+#[async_trait]
+impl SandboxProvider for BoatProvider {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            lease_ttl: true,
+            snapshot_retention: true,
+            usage_reporting: true,
+            templates: true,
+        }
+    }
+
+    fn guest_user(&self) -> GuestUser {
+        GuestUser {
+            username: "user".into(),
+            home_dir: "/home/user".into(),
+        }
+    }
+
+    async fn create(&self, spec: CreateSandboxSpec<'_>) -> Result<RemoteSandbox> {
         let mut body = json!({
-            "type": sandbox.size, "noEnv": true, "ttlSeconds": ttl,
-            "name": sandbox.alias, "visibility": "private",
+            "type": spec.size, "noEnv": true,
+            "name": sandbox_alias(spec.owner, spec.sandbox_name), "visibility": "private",
             "labels": {
-                "t3fleet.managed": "true", "t3fleet.user": username, "t3fleet.sandbox": sandbox.name,
+                "t3fleet.managed": "true", "t3fleet.user": spec.owner, "t3fleet.sandbox": spec.sandbox_name,
             },
         });
-        if let Some(template) = template {
+        if let Some(ttl) = spec.lease_ttl_secs {
+            body["ttlSeconds"] = json!(ttl);
+        }
+        if let Some(template) = spec.template {
             body["from"] = json!(template);
         }
         let response = self
             .request(Method::POST, &["sandboxes"])
-            .header("Idempotency-Key", idempotency_key)
+            .header("Idempotency-Key", spec.idempotency_key)
             .json(&body)
             .send()
             .await
@@ -212,10 +234,10 @@ impl Boat {
                 && !payload.sandbox.id.starts_with("pending:"),
             "Boat create failed"
         );
-        Ok(payload.sandbox)
+        Ok(payload.sandbox.into())
     }
 
-    pub async fn get(&self, id: &str) -> Result<Option<RemoteSandbox>> {
+    async fn get(&self, id: &str) -> Result<Option<RemoteSandbox>> {
         let response = self.request(Method::GET, &["sandboxes", id]).send().await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -225,35 +247,10 @@ impl Boat {
             payload.ok && payload.sandbox.id == id,
             "invalid Boat sandbox status"
         );
-        Ok(Some(payload.sandbox))
+        Ok(Some(payload.sandbox.into()))
     }
 
-    pub async fn wait_for(&self, id: &str, archived: bool) -> Result<RemoteSandbox> {
-        tokio::time::timeout(Duration::from_secs(180), async {
-            loop {
-                let sandbox = self.get(id).await?.context("Boat sandbox not found")?;
-                if (archived && sandbox.state == "archived") || (!archived && sandbox.running()) {
-                    return Ok(sandbox);
-                }
-                if matches!(sandbox.state.as_str(), "error" | "cancelled") {
-                    bail!(
-                        "Boat sandbox entered terminal state '{}'{}",
-                        sandbox.state,
-                        sandbox
-                            .error
-                            .as_deref()
-                            .map(|msg| format!(": {msg}"))
-                            .unwrap_or_default()
-                    );
-                }
-                sleep(Duration::from_secs(1)).await;
-            }
-        })
-        .await
-        .context("timed out waiting for Boat sandbox")?
-    }
-
-    pub async fn ttl(&self, id: &str, ttl: u64) -> Result<()> {
+    async fn extend_lease(&self, id: &str, ttl: u64) -> Result<()> {
         let response = self
             .request(Method::PATCH, &["sandboxes", id])
             .json(&json!({ "ttlSeconds": ttl }))
@@ -263,7 +260,7 @@ impl Boat {
         Ok(())
     }
 
-    pub async fn request_stop(&self, id: &str) -> Result<()> {
+    async fn suspend(&self, id: &str) -> Result<()> {
         let response = self
             .request(Method::POST, &["sandboxes", id, "stop"])
             .json(&json!({ "force": false }))
@@ -273,10 +270,14 @@ impl Boat {
         Ok(())
     }
 
-    pub async fn resume(&self, id: &str, ttl: u64) -> Result<ResumeOutcome> {
+    async fn resume(&self, id: &str, lease_ttl_secs: Option<u64>) -> Result<ResumeOutcome> {
+        let body = match lease_ttl_secs {
+            Some(ttl) => json!({ "ttlSeconds": ttl }),
+            None => json!({}),
+        };
         let response = self
             .request(Method::POST, &["sandboxes", id, "resume"])
-            .json(&json!({ "ttlSeconds": ttl }))
+            .json(&body)
             .send()
             .await?;
         match response.status() {
@@ -298,7 +299,7 @@ impl Boat {
         Ok(ResumeOutcome::Ready(self.wait_for(id, false).await?))
     }
 
-    pub async fn save_snapshot(&self, id: &str, name: &str) -> Result<()> {
+    async fn save_snapshot(&self, id: &str, name: &str) -> Result<()> {
         let response = self
             .request(Method::POST, &["saved-snapshots"])
             .json(&json!({ "sandboxId": id, "name": name }))
@@ -314,7 +315,7 @@ impl Boat {
         Ok(())
     }
 
-    pub async fn saved_snapshot(&self, name: &str) -> Result<Option<SavedSnapshot>> {
+    async fn saved_snapshot(&self, name: &str) -> Result<Option<SavedSnapshot>> {
         let response = self
             .request(Method::GET, &["saved-snapshots", name])
             .send()
@@ -327,10 +328,20 @@ impl Boat {
             payload.ok && payload.snapshot.name == name,
             "invalid Boat saved snapshot status"
         );
-        Ok(Some(payload.snapshot))
+        let snapshot = payload.snapshot;
+        Ok(Some(SavedSnapshot {
+            status: match snapshot.status {
+                BoatSnapshotStatus::Saving => SnapshotStatus::Saving,
+                BoatSnapshotStatus::Ready => SnapshotStatus::Ready,
+                BoatSnapshotStatus::Failed => SnapshotStatus::Failed,
+            },
+            error: snapshot.error,
+            source_sandbox_id: snapshot.source_sandbox_id,
+            created_at: snapshot.created_at,
+        }))
     }
 
-    pub async fn delete_saved_snapshot(&self, name: &str) -> Result<()> {
+    async fn delete_saved_snapshot(&self, name: &str) -> Result<()> {
         let response = self
             .request(Method::DELETE, &["saved-snapshots", name])
             .send()
@@ -341,7 +352,7 @@ impl Boat {
         Ok(())
     }
 
-    pub async fn usage(&self, id: &str) -> Result<Option<SandboxUsage>> {
+    async fn usage(&self, id: &str) -> Result<Option<SandboxUsage>> {
         let response = self
             .request(Method::GET, &["sandboxes", id, "usage"])
             .send()
@@ -363,7 +374,7 @@ impl Boat {
         }))
     }
 
-    pub async fn delete(&self, id: &str) -> Result<()> {
+    async fn delete(&self, id: &str) -> Result<()> {
         let response = self
             .request(Method::DELETE, &["sandboxes", id])
             .header("X-Ascii-Confirm-Delete", id)
@@ -375,13 +386,13 @@ impl Boat {
         Ok(())
     }
 
-    pub async fn authorize_key(&self, id: &str, key: &str) -> Result<SshTicketResponse> {
+    async fn authorize_ssh(&self, id: &str, public_key: &str) -> Result<SshAccess> {
         let deadline = Instant::now() + Duration::from_secs(40);
         let mut delay = Duration::from_millis(250);
         loop {
             let response = self
                 .request(Method::POST, &["sandboxes", id, "sshkey"])
-                .json(&json!({ "key": key }))
+                .json(&json!({ "key": public_key }))
                 .send()
                 .await?;
             if response.status() == StatusCode::CONFLICT {
@@ -423,21 +434,21 @@ impl Boat {
                 ),
             };
             ensure!(!host.is_empty() && port != 0, "invalid Boat SSH endpoint");
-            return Ok(SshTicketResponse {
+            return Ok(SshAccess {
                 host,
                 port,
-                host_key: payload.host_key,
+                host_key: Some(payload.host_key),
                 ssh_user: payload.ssh_user,
                 sandbox_id: id.to_owned(),
             });
         }
     }
 
-    pub async fn command(&self, id: &str, command: &str, timeout: u64) -> Result<String> {
+    async fn exec(&self, id: &str, command: &str, timeout: Duration) -> Result<String> {
         let response = self
             .request(Method::POST, &["sandboxes", id, "commands"])
-            .timeout(Duration::from_secs(timeout + 15))
-            .json(&json!({ "command": command, "timeoutSeconds": timeout }))
+            .timeout(timeout + Duration::from_secs(15))
+            .json(&json!({ "command": command, "timeoutSeconds": timeout.as_secs() }))
             .send()
             .await?;
         let payload: CommandResponse = Self::json(response, "command").await?;

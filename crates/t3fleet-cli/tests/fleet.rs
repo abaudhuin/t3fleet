@@ -4,13 +4,18 @@ use std::{
     io::Read,
     net::{Ipv4Addr, SocketAddr},
     process::{Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use anyhow::Result;
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{OriginalUri, State},
@@ -21,10 +26,17 @@ use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use t3fleet_protocol::{
-    AdminUsageEntry, EnrollResponse, InviteResponse, PairResponse, SshTicketResponse,
+    AdminUsageEntry, EnrollResponse, InviteResponse, PairResponse, SandboxUsage, SshTicketResponse,
     StatusResponse, WakePolicy,
 };
-use t3fleet_server::{App, Settings};
+use t3fleet_server::{
+    App, Settings,
+    provider::{
+        CreateSandboxSpec, GuestUser, ProviderCapabilities, ProviderRegistry, RemoteSandbox,
+        ResumeOutcome, SandboxProvider, SandboxState, SavedSnapshot, SshAccess,
+    },
+    providers::boat::BoatProvider,
+};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -81,6 +93,137 @@ impl BoatMock {
             .iter()
             .filter(|call| call.method == method && call.path == path)
             .count()
+    }
+}
+
+struct StubProvider {
+    remote: Mutex<Option<RemoteSandbox>>,
+    active: AtomicBool,
+    bootstraps: AtomicUsize,
+    ssh: SocketAddr,
+}
+
+#[async_trait]
+impl SandboxProvider for StubProvider {
+    fn name(&self) -> &'static str {
+        "stub-vm"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
+    fn guest_user(&self) -> GuestUser {
+        GuestUser {
+            username: "ubuntu".into(),
+            home_dir: "/home/ubuntu".into(),
+        }
+    }
+
+    async fn create(&self, spec: CreateSandboxSpec<'_>) -> Result<RemoteSandbox> {
+        assert_eq!(spec.owner, "alice");
+        assert_eq!(spec.sandbox_name, "default");
+        assert!(spec.lease_ttl_secs.is_none() && spec.template.is_none());
+        let mut sandbox = self.remote.lock().unwrap();
+        assert!(sandbox.is_none());
+        let remote = RemoteSandbox {
+            id: "vm-1".into(),
+            state: SandboxState::Running,
+            error: None,
+            lease_expires_at: None,
+            stopped_at: None,
+        };
+        *sandbox = Some(remote.clone());
+        Ok(remote)
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<RemoteSandbox>> {
+        assert_eq!(id, "vm-1");
+        Ok(self.remote.lock().unwrap().clone())
+    }
+
+    async fn resume(&self, id: &str, lease_ttl_secs: Option<u64>) -> Result<ResumeOutcome> {
+        assert_eq!(id, "vm-1");
+        assert!(lease_ttl_secs.is_none());
+        let mut sandbox = self.remote.lock().unwrap();
+        let remote = sandbox.as_mut().unwrap();
+        assert!(remote.state.is_stopped());
+        remote.state = SandboxState::Running;
+        remote.stopped_at = None;
+        Ok(ResumeOutcome::Ready(remote.clone()))
+    }
+
+    async fn suspend(&self, id: &str) -> Result<()> {
+        assert_eq!(id, "vm-1");
+        let mut sandbox = self.remote.lock().unwrap();
+        let remote = sandbox.as_mut().unwrap();
+        assert!(remote.state.is_running());
+        remote.state = SandboxState::Stopped;
+        remote.stopped_at = Some(Utc::now() - TimeDelta::days(20));
+        Ok(())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        assert_eq!(id, "vm-1");
+        self.remote.lock().unwrap().take();
+        Ok(())
+    }
+
+    async fn authorize_ssh(&self, id: &str, public_key: &str) -> Result<SshAccess> {
+        assert!(self.get(id).await?.unwrap().state.is_running());
+        assert!(public_key.starts_with("ssh-ed25519 "));
+        Ok(SshAccess {
+            host: self.ssh.ip().to_string(),
+            port: self.ssh.port(),
+            ssh_user: "ubuntu".into(),
+            host_key: None,
+            sandbox_id: id.into(),
+        })
+    }
+
+    async fn exec(&self, id: &str, command: &str, timeout: Duration) -> Result<String> {
+        assert!(self.get(id).await?.unwrap().state.is_running());
+        assert!(command.contains("/home/ubuntu"));
+        if command.contains("ssh_conns") {
+            assert_eq!(timeout, Duration::from_secs(15));
+            let active = usize::from(self.active.load(Ordering::Relaxed));
+            Ok(json!({"active_turns": active}).to_string())
+        } else if command.contains("auth pairing create") {
+            assert_eq!(timeout, Duration::from_secs(300));
+            assert!(command.contains("guest_user='ubuntu'"));
+            Ok(json!({
+                "credential": "pair-stub",
+                "pairUrl": "http://127.0.0.1:13773/pair#token=pair-stub",
+                "expiresAt": Utc::now() + TimeDelta::minutes(15),
+            })
+            .to_string())
+        } else {
+            assert_eq!(timeout, Duration::from_secs(300));
+            assert!(command.contains("User=ubuntu\n"));
+            assert!(command.contains("Environment=T3CODE_HOME=/home/ubuntu/.t3"));
+            self.bootstraps.fetch_add(1, Ordering::Relaxed);
+            Ok(String::new())
+        }
+    }
+
+    async fn extend_lease(&self, _id: &str, _ttl: u64) -> Result<()> {
+        panic!("lease extension is unsupported")
+    }
+
+    async fn usage(&self, _id: &str) -> Result<Option<SandboxUsage>> {
+        panic!("usage reporting is unsupported")
+    }
+
+    async fn save_snapshot(&self, _id: &str, _name: &str) -> Result<()> {
+        panic!("snapshot retention is unsupported")
+    }
+
+    async fn saved_snapshot(&self, _name: &str) -> Result<Option<SavedSnapshot>> {
+        panic!("snapshot retention is unsupported")
+    }
+
+    async fn delete_saved_snapshot(&self, _name: &str) -> Result<()> {
+        panic!("snapshot retention is unsupported")
     }
 }
 
@@ -462,6 +605,161 @@ async fn rejected(request: RequestBuilder, expected: StatusCode) -> String {
 }
 
 #[tokio::test]
+async fn durable_provider_runs_the_full_lifecycle_without_optional_capabilities() {
+    let fleet = Fleet::start(false).await;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let stub = Arc::new(StubProvider {
+        remote: Mutex::new(None),
+        active: AtomicBool::new(true),
+        bootstraps: AtomicUsize::new(0),
+        ssh: listener.local_addr().unwrap(),
+    });
+    let settings = || settings(&fleet.temp, &fleet.boat_url, true);
+    let provider_registry = |default| {
+        let mut registry = ProviderRegistry::new(default);
+        let settings = settings();
+        registry.register(Arc::new(
+            BoatProvider::new(
+                &settings.boat_api_base,
+                &settings.boat_api_key,
+                settings.boat_org.as_deref(),
+            )
+            .unwrap(),
+        ));
+        registry.register(stub.clone());
+        registry
+    };
+    let (app, _) = App::open_with_providers(settings(), provider_registry("stub-vm")).unwrap();
+    let (url, server) = serve(app.router()).await;
+    let request = |method, path: &str| fleet.http.request(method, format!("{url}{path}"));
+    let admin = |method, path: &str| request(method, path).bearer_auth(ADMIN);
+
+    let error = rejected(
+        admin(Method::POST, "/v1/admin/users")
+            .json(&json!({"username": "alice", "template": "team-base"})),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(error.contains("does not support templates"));
+    let invite: InviteResponse =
+        ok(admin(Method::POST, "/v1/admin/users").json(&json!({"username": "alice"}))).await;
+    assert_eq!(invite.sandbox_id.as_deref(), Some("vm-1"));
+
+    let dir = fleet.temp.path().join("stub-device");
+    let config_path = dir.join("config.toml");
+    success(
+        fleet
+            .cli()
+            .args([
+                "join",
+                "--server",
+                &url,
+                "--token",
+                &invite.enrollment_token,
+            ])
+            .arg("--config-dir")
+            .arg(&dir)
+            .arg("--ssh-config")
+            .arg(fleet.temp.path().join("stub-ssh"))
+            .output()
+            .await
+            .unwrap(),
+    );
+    let config: toml::Value = toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(config["ssh_user"].as_str(), Some("ubuntu"));
+    let api_token = config["api_token"].as_str().unwrap();
+    let me = |method, path: &str| request(method, path).bearer_auth(api_token);
+    let fragment = fs::read_to_string(dir.join("ssh/t3fleet-alice.conf")).unwrap();
+    assert!(fragment.contains("  User ubuntu\n"));
+
+    let error = rejected(
+        me(Method::POST, "/v1/me/sandboxes")
+            .json(&json!({"name": "work", "template": "team-base"})),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(error.contains("does not support templates"));
+    let status = || me(Method::GET, "/v1/me/status?include_usage=true");
+    let running: StatusResponse = ok(status()).await;
+    assert_eq!(running.provider.as_deref(), Some("stub-vm"));
+    assert_eq!(running.ssh_user, "ubuntu");
+    assert_eq!(running.state.as_deref(), Some("running"));
+    assert!(running.usage.is_none());
+    let usage: Vec<AdminUsageEntry> = ok(admin(Method::GET, "/v1/admin/usage")).await;
+    assert!(usage.is_empty());
+
+    let ticket: SshTicketResponse = ok(me(Method::POST, "/v1/me/ssh-ticket")
+        .json(&json!({"ssh_public_key": KEY, "intent": "explicit"})))
+    .await;
+    assert_eq!(ticket.ssh_user, "ubuntu");
+    assert!(ticket.host_key.is_none());
+    let known_hosts = dir.join("known_hosts");
+    let trusted = format!("t3fleet-alice {KEY}\n");
+    fs::write(&known_hosts, &trusted).unwrap();
+    let gateway = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream.write_all(b"stub banner").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let proxy = fleet
+        .cli()
+        .arg("ssh-proxy")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["--alias", "t3fleet-alice"])
+        .output();
+    assert_eq!(
+        success(
+            timeout(Duration::from_secs(10), proxy)
+                .await
+                .unwrap()
+                .unwrap()
+        ),
+        "stub banner"
+    );
+    gateway.await.unwrap();
+    assert_eq!(fs::read_to_string(&known_hosts).unwrap(), trusted);
+
+    let pair: PairResponse = ok(me(Method::POST, "/v1/me/pair")
+        .json(&json!({"local_port": 13773, "label": "Alice's laptop"})))
+    .await;
+    assert_eq!(pair.credential, "pair-stub");
+
+    app.watch_once().await.unwrap();
+    let active: StatusResponse = ok(status()).await;
+    assert_eq!(active.state.as_deref(), Some("running"));
+    assert_eq!(active.activity.unwrap().active_turns, 1);
+    stub.active.store(false, Ordering::Relaxed);
+    app.watch_once().await.unwrap();
+    app.watch_once().await.unwrap(); // The stopped disk is old enough for snapshot retention.
+    let idle: StatusResponse = ok(status()).await;
+    assert_eq!(idle.state.as_deref(), Some("stopped"));
+    assert_eq!(idle.stopped_reason.as_deref(), Some("idle"));
+
+    let awake: StatusResponse = ok(me(Method::POST, "/v1/me/wake")).await;
+    assert_eq!(awake.sandbox_id.as_deref(), Some("vm-1"));
+    assert_eq!(awake.state.as_deref(), Some("running"));
+    let stopped: StatusResponse = ok(me(Method::POST, "/v1/me/stop")).await;
+    assert_eq!(stopped.state.as_deref(), Some("stopped"));
+    assert_eq!(stopped.stopped_reason.as_deref(), Some("manual"));
+    assert_eq!(stub.bootstraps.load(Ordering::Relaxed), 1);
+    server.abort();
+
+    let (app, _) = App::open_with_providers(settings(), provider_registry("boat")).unwrap();
+    let (url, server) = serve(app.router()).await;
+    let awake: StatusResponse = ok(fleet
+        .http
+        .post(format!("{url}/v1/me/wake"))
+        .bearer_auth(api_token))
+    .await;
+    assert_eq!(awake.provider.as_deref(), Some("stub-vm"));
+    assert_eq!(awake.sandbox_id.as_deref(), Some("vm-1"));
+    assert_eq!(awake.state.as_deref(), Some("running"));
+    assert!(fleet.boat.lock().unwrap().calls.is_empty());
+    server.abort();
+}
+
+#[tokio::test]
 async fn invitation_expiry_single_use_and_device_revocation() {
     let fleet = Fleet::start(false).await;
     let health: Value = ok(fleet.request(Method::GET, "/healthz")).await;
@@ -602,7 +900,7 @@ async fn tenants_are_isolated_and_manual_stop_requires_explicit_wake() {
         .json(&json!({"sandbox_id": bob.sandbox_id})))
     .await;
     assert_eq!(stopped.sandbox_id.as_deref(), Some("bx_alice"));
-    assert_eq!(stopped.state.as_deref(), Some("archived"));
+    assert_eq!(stopped.state.as_deref(), Some("stopped"));
     assert_eq!(stopped.stopped_reason.as_deref(), Some("manual"));
     assert!(stopped.stopped_at.is_some());
 
@@ -626,14 +924,14 @@ async fn tenants_are_isolated_and_manual_stop_requires_explicit_wake() {
     assert_eq!(returned.port, 22);
     let bob_state: StatusResponse = ok(fleet.me(&bob, Method::GET, "/v1/me/status")).await;
     assert_eq!(bob_state.sandbox_id.as_deref(), Some("bx_bob"));
-    assert_ne!(bob_state.state.as_deref(), Some("archived"));
+    assert_ne!(bob_state.state.as_deref(), Some("stopped"));
 
     let _: StatusResponse = ok(fleet.admin(Method::POST, "/v1/admin/sandboxes/bob/stop")).await;
     let wake: StatusResponse = ok(fleet.me(&alice, Method::POST, "/v1/me/wake?username=bob")).await;
     assert_eq!(wake.sandbox_id.as_deref(), Some("bx_alice"));
     assert!(wake.stopped_reason.is_none());
     let bob_state: StatusResponse = ok(fleet.me(&bob, Method::GET, "/v1/me/status")).await;
-    assert_eq!(bob_state.state.as_deref(), Some("archived"));
+    assert_eq!(bob_state.state.as_deref(), Some("stopped"));
     let _: StatusResponse = ok(fleet.admin(Method::POST, "/v1/admin/sandboxes/bob/wake")).await;
     let _: Value = ok(fleet.admin(Method::DELETE, "/v1/admin/users/bob?delete_sandbox=true")).await;
     rejected(
@@ -699,13 +997,13 @@ async fn watchdog_stops_idle_extends_active_ttl_and_survives_probe_failure() {
 
     for device in [&idle, &archived] {
         let status: StatusResponse = ok(fleet.me(device, Method::GET, "/v1/me/status")).await;
-        assert_eq!(status.state.as_deref(), Some("archived"));
+        assert_eq!(status.state.as_deref(), Some("stopped"));
         assert_eq!(status.stopped_reason.as_deref(), Some("idle"));
         assert!(status.stopped_at.is_some());
     }
     for device in [&active, &failed] {
         let status: StatusResponse = ok(fleet.me(device, Method::GET, "/v1/me/status")).await;
-        assert_ne!(status.state.as_deref(), Some("archived"));
+        assert_ne!(status.state.as_deref(), Some("stopped"));
     }
     {
         let boat = fleet.boat.lock().unwrap();
@@ -977,7 +1275,7 @@ async fn aggressive_idle_stops_idle_tunnel_and_prevents_reconnect_wake_loop() {
 
     let tunnel_status: StatusResponse =
         ok(fleet.me(&idle_tunnel, Method::GET, "/v1/me/status")).await;
-    assert_eq!(tunnel_status.state.as_deref(), Some("archived"));
+    assert_eq!(tunnel_status.state.as_deref(), Some("stopped"));
     assert_eq!(tunnel_status.stopped_reason.as_deref(), Some("idle"));
     assert_eq!(tunnel_status.wake_policy, WakePolicy::AggressiveIdle);
     assert_eq!(
@@ -987,7 +1285,7 @@ async fn aggressive_idle_stops_idle_tunnel_and_prevents_reconnect_wake_loop() {
 
     let busy_status: StatusResponse =
         ok(fleet.me(&active_turn, Method::GET, "/v1/me/status")).await;
-    assert_ne!(busy_status.state.as_deref(), Some("archived"));
+    assert_ne!(busy_status.state.as_deref(), Some("stopped"));
     assert_eq!(
         busy_status.activity.as_ref().map(|a| a.active_turns),
         Some(1)
@@ -1290,7 +1588,9 @@ async fn templates_and_usage_are_available_from_the_cli() {
             .unwrap()
             .starts_with(concat!(
                 "set -eu\n",
-                "if [ -x /home/user/.local/bin/t3 ] && systemctl is-active --quiet t3code; then\n",
+                "guest_user='user'\n",
+                "guest_home='/home/user'\n",
+                "if [ -x \"$guest_home/.local/bin/t3\" ] && systemctl is-active --quiet t3code; then\n",
                 "    exit 0\nfi\n",
             ))
     );

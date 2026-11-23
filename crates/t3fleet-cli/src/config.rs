@@ -10,7 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use t3fleet_protocol::{DEFAULT_SANDBOX_NAME, valid_sandbox_name};
+use t3fleet_protocol::{DEFAULT_SANDBOX_NAME, default_ssh_user, valid_sandbox_name};
 use tempfile::{NamedTempFile, TempPath};
 use tokio::process::Command;
 
@@ -27,6 +27,8 @@ pub struct Config {
     pub username: String,
     pub api_token: String,
     pub ssh_alias: String,
+    #[serde(default = "default_ssh_user")]
+    pub ssh_user: String,
     pub sandbox_id: String,
     pub server_t3_port: u16,
     pub ssh_config: PathBuf,
@@ -221,7 +223,20 @@ pub fn validate_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn write_ssh(config: &Config, config_path: &Path, alias: &str) -> Result<()> {
+pub fn validate_ssh_user(user: &str) -> Result<()> {
+    ensure!(
+        !user.is_empty()
+            && !user.starts_with('-')
+            && user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.+$".contains(&b)),
+        "invalid SSH user"
+    );
+    Ok(())
+}
+
+pub fn write_ssh(config: &Config, config_path: &Path, alias: &str, ssh_user: &str) -> Result<()> {
+    validate_ssh_user(ssh_user)?;
     let binary = proxy_path(&std::env::current_exe()?)?;
     let config_arg = proxy_path(config_path)?;
     let identity = ssh_path(&config.identity_file)?;
@@ -230,7 +245,7 @@ pub fn write_ssh(config: &Config, config_path: &Path, alias: &str) -> Result<()>
     let fragment_path = fragment_dir.join(format!("{alias}.conf"));
     create_dir(&fragment_dir)?;
     let fragment = format!(
-        "Host {alias}\n  User user\n  IdentityFile {identity}\n  IdentitiesOnly yes\n  \
+        "Host {alias}\n  User {ssh_user}\n  IdentityFile {identity}\n  IdentitiesOnly yes\n  \
          HostKeyAlias {alias}\n  UserKnownHostsFile {known}\n  StrictHostKeyChecking yes\n  \
          ServerAliveInterval 30\n  ServerAliveCountMax 3\n  \
          ProxyCommand {binary} ssh-proxy --config {config_arg} --alias {alias}\n"
