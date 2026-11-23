@@ -30,7 +30,6 @@ pub struct Config {
     #[serde(default = "default_ssh_user")]
     pub ssh_user: String,
     pub sandbox_id: String,
-    pub server_t3_port: u16,
     pub ssh_config: PathBuf,
     pub identity_file: PathBuf,
     pub known_hosts: PathBuf,

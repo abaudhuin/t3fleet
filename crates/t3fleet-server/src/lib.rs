@@ -339,7 +339,6 @@ impl App {
             .route("/v1/me/wake", post(me_wake))
             .route("/v1/me/stop", post(me_stop))
             .route("/v1/me/ssh-ticket", post(ssh_ticket))
-            .route("/v1/me/pair", post(pair))
             .route("/v1/admin/users", get(list_users).post(create_user))
             .route("/v1/admin/usage", get(admin_usage))
             .route("/v1/admin/users/{username}", delete(delete_user))
@@ -635,7 +634,6 @@ async fn enroll(
         ssh_alias: sandbox.alias,
         sandbox_id: sandbox.provider_sandbox_id,
         ssh_user,
-        server_t3_port: T3_PORT,
     }))
 }
 
@@ -787,29 +785,4 @@ async fn ssh_ticket(
         host_key: access.host_key,
         sandbox_id: access.sandbox_id,
     }))
-}
-
-async fn pair(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Json(request): Json<PairRequest>,
-) -> ApiResult<PairResponse> {
-    let (user, _guard) = app.employee(&headers).await?;
-    if request.local_port == 0
-        || request.label.trim().is_empty()
-        || request.label.len() > 255
-        || request.label.chars().any(char::is_control)
-    {
-        return Err(ApiError::bad(
-            "Pairing requires a nonzero local port and a printable label of 1–255 bytes",
-        ));
-    }
-    let sandbox = app
-        .ready(
-            &user,
-            sandbox_name(request.sandbox_name.as_deref())?,
-            WakeIntent::Explicit,
-        )
-        .await?;
-    Ok(Json(app.pairing(&sandbox, request).await?))
 }

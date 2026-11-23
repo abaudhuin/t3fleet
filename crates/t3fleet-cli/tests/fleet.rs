@@ -26,7 +26,7 @@ use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use t3fleet_protocol::{
-    AdminUsageEntry, EnrollResponse, InviteResponse, PairResponse, SandboxUsage, SshTicketResponse,
+    AdminUsageEntry, EnrollResponse, InviteResponse, SandboxUsage, SshTicketResponse,
     StatusResponse, WakePolicy,
 };
 use t3fleet_server::{
@@ -188,15 +188,6 @@ impl SandboxProvider for StubProvider {
             assert_eq!(timeout, Duration::from_secs(15));
             let active = usize::from(self.active.load(Ordering::Relaxed));
             Ok(json!({"active_turns": active}).to_string())
-        } else if command.contains("auth pairing create") {
-            assert_eq!(timeout, Duration::from_secs(300));
-            assert!(command.contains("guest_user='ubuntu'"));
-            Ok(json!({
-                "credential": "pair-stub",
-                "pairUrl": "http://127.0.0.1:13773/pair#token=pair-stub",
-                "expiresAt": Utc::now() + TimeDelta::minutes(15),
-            })
-            .to_string())
         } else {
             assert_eq!(timeout, Duration::from_secs(300));
             assert!(command.contains("User=ubuntu\n"));
@@ -431,14 +422,6 @@ async fn mock_boat(
                         return (StatusCode::BAD_GATEWAY, Json(json!({"ok": false})));
                     }
                 }
-            } else if command.contains("auth pairing create") {
-                assert_eq!(body["timeoutSeconds"], 300);
-                json!({
-                    "credential": "pair&secret",
-                    "pairUrl": "http://127.0.0.1:13773/pair#token=pair%26secret",
-                    "expiresAt": Utc::now() + TimeDelta::minutes(15),
-                })
-                .to_string()
             } else {
                 assert_eq!(body["timeoutSeconds"], 300);
                 assert!(command.contains("systemctl enable --now t3code"));
@@ -720,11 +703,6 @@ async fn durable_provider_runs_the_full_lifecycle_without_optional_capabilities(
     gateway.await.unwrap();
     assert_eq!(fs::read_to_string(&known_hosts).unwrap(), trusted);
 
-    let pair: PairResponse = ok(me(Method::POST, "/v1/me/pair")
-        .json(&json!({"local_port": 13773, "label": "Alice's laptop"})))
-    .await;
-    assert_eq!(pair.credential, "pair-stub");
-
     app.watch_once().await.unwrap();
     let active: StatusResponse = ok(status()).await;
     assert_eq!(active.state.as_deref(), Some("running"));
@@ -805,7 +783,6 @@ async fn invitation_expiry_single_use_and_device_revocation() {
     let employee: EnrollResponse = accepted.json().await.unwrap();
     assert!(employee.api_token.starts_with("usr_"));
     assert_eq!(employee.ssh_alias, "t3fleet-alice");
-    assert_eq!(employee.server_t3_port, 3773);
     rejected(fleet.enroll(token, "reused"), StatusCode::UNAUTHORIZED).await;
 
     let second: InviteResponse = ok(fleet
@@ -1036,23 +1013,18 @@ async fn watchdog_stops_idle_extends_active_ttl_and_survives_probe_failure() {
 }
 
 #[tokio::test]
-async fn bootstrap_pairing_and_ssh_key_retry() {
+async fn bootstrap_and_ssh_key_retry() {
     let fleet = Fleet::start(true).await;
     fleet.boat.lock().unwrap().transient_keys = 2;
     let alice = fleet.employee("alice", true).await;
     let _: StatusResponse = ok(fleet.me(&alice, Method::POST, "/v1/me/stop")).await;
-    let pair: PairResponse = ok(fleet
-        .me(&alice, Method::POST, "/v1/me/pair")
-        .json(&json!({"local_port": 13773, "label": "Alice's laptop"})))
+    let ticket: SshTicketResponse = ok(fleet
+        .me(&alice, Method::POST, "/v1/me/ssh-ticket")
+        .json(&json!({"ssh_public_key": KEY, "intent": "explicit"})))
     .await;
-    assert_eq!(pair.credential, "pair&secret");
-    assert_eq!(
-        pair.t3_deep_link,
-        "t3code://pair?pairingUrl=http%3A%2F%2F127.0.0.1%3A13773%2Fpair%23token%3Dpair%2526secret"
-    );
-    assert_eq!(pair.ssh_alias, alice.ssh_alias);
+    assert_eq!(ticket.sandbox_id, alice.sandbox_id);
     let boat = fleet.boat.lock().unwrap();
-    assert_eq!(boat.count(Method::POST, "/sandboxes/bx_alice/sshkey"), 3);
+    assert_eq!(boat.count(Method::POST, "/sandboxes/bx_alice/sshkey"), 4);
     assert_eq!(boat.count(Method::POST, "/sandboxes/bx_alice/resume"), 1);
 
     let commands = boat
@@ -1061,13 +1033,10 @@ async fn bootstrap_pairing_and_ssh_key_retry() {
         .filter(|call| call.path == "/sandboxes/bx_alice/commands")
         .map(|call| call.body["command"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 1);
     assert!(commands[0].contains("curl -fsSL https://t3.codes/install.sh | sh"));
     assert!(commands[0].contains("serve --host 127.0.0.1 --port 3773"));
     assert!(commands[0].contains("Environment=T3CODE_HOME=/home/user/.t3"));
-    assert!(commands[1].contains("systemctl start t3code"));
-    assert!(commands[1].contains("--base-url 'http://127.0.0.1:13773'"));
-    assert!(commands[1].contains(r#"--label 'Alice'"'"'s laptop'"#));
 }
 
 fn success(output: Output) -> String {
@@ -1169,18 +1138,6 @@ async fn cli_join_installs_ssh_config_and_proxy_pins_key_and_relays_bytes() {
     ))
     .unwrap();
     assert_eq!(status.username, "alice");
-    let links = success(
-        fleet
-            .cli()
-            .arg("--config")
-            .arg(&config)
-            .args(["connect", "--no-tunnel"])
-            .output()
-            .await
-            .unwrap(),
-    );
-    assert!(links.contains("t3code://pair") && links.contains("13773"));
-
     let known_hosts = dir.join("known_hosts");
     let stale = "t3fleet-alice ssh-ed25519 stale\nunrelated ssh-ed25519 key\n";
     fs::write(&known_hosts, stale).unwrap();
@@ -1401,13 +1358,6 @@ async fn cli_manages_named_sandboxes_and_syncs_ssh_fragments() {
     assert_eq!(listed[1].sandbox_name.as_deref(), Some("default"));
     success(cli(&["stop", "--sandbox", "build"]).output().await.unwrap());
     success(cli(&["wake", "--sandbox", "build"]).output().await.unwrap());
-    let links = success(
-        cli(&["connect", "--sandbox", "build", "--no-tunnel"])
-            .output()
-            .await
-            .unwrap(),
-    );
-    assert!(links.contains("t3code://pair"));
 
     for (args, message) in [
         (["sandbox", "new", "other"], "Sandbox limit reached"),

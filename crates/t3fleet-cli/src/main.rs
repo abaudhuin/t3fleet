@@ -2,11 +2,10 @@ mod api;
 mod config;
 
 use std::{
-    io::IsTerminal,
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     path::{Path, PathBuf},
     pin::Pin,
-    process::{ExitCode, ExitStatus, Stdio},
+    process::{ExitCode, ExitStatus},
     task::{Context as TaskContext, Poll, ready},
     time::Duration,
 };
@@ -14,7 +13,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use api::{Api, send};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::Config;
@@ -24,13 +23,10 @@ use serde_json::Value;
 use t3fleet_protocol::*;
 use tokio::{
     io::{self, AsyncWrite},
-    net::{TcpListener, TcpStream},
-    process::{Child, Command},
+    net::TcpStream,
+    process::Command,
     sync::oneshot,
-    time::{Instant, sleep},
 };
-
-const DEFAULT_TUNNEL_PORT: u16 = 13773;
 
 #[derive(Parser)]
 #[command(version, about = "Manage and connect to your T3 Code sandbox")]
@@ -65,17 +61,6 @@ enum Action {
         sandbox: Option<String>,
         #[arg(last = true)]
         command: Vec<String>,
-    },
-    Connect {
-        #[arg(long, default_value_t = DEFAULT_TUNNEL_PORT, value_parser = clap::value_parser!(u16).range(1..))]
-        port: u16,
-        #[arg(long)]
-        no_tunnel: bool,
-        /// Print the pairing link without opening T3 Code Desktop
-        #[arg(long)]
-        no_open: bool,
-        #[arg(long)]
-        sandbox: Option<String>,
     },
     Sandbox {
         #[command(subcommand)]
@@ -122,9 +107,6 @@ struct Join {
     device_name: Option<String>,
     #[arg(long)]
     allow_insecure_http: bool,
-    /// Deprecated no-op: `join` no longer opens a tunnel
-    #[arg(long, hide = true)]
-    no_connect: bool,
 }
 
 #[derive(Args)]
@@ -278,14 +260,6 @@ impl Cli {
                 return Ok(exit_code(status));
             }
             Action::SshProxy { alias } => proxy(&config, &alias).await?,
-            Action::Connect {
-                port,
-                no_tunnel,
-                no_open,
-                sandbox,
-            } => {
-                connect(&config, port, no_tunnel, no_open, sandbox).await?;
-            }
             Action::Status {
                 json,
                 sandbox,
@@ -357,10 +331,6 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
     .await?;
     config::validate_alias(&response.ssh_alias)?;
     config::validate_ssh_user(&response.ssh_user)?;
-    ensure!(
-        response.server_t3_port != 0,
-        "server returned an invalid T3 Code port"
-    );
     let config = Config {
         server: args.server,
         username: response.username,
@@ -368,7 +338,6 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
         ssh_alias: response.ssh_alias,
         ssh_user: response.ssh_user,
         sandbox_id: response.sandbox_id,
-        server_t3_port: response.server_t3_port,
         ssh_config,
         identity_file,
         known_hosts,
@@ -793,159 +762,5 @@ impl AsyncWrite for ProxyOutput {
             let _ = closed.send(());
         }
         Poll::Ready(Ok(()))
-    }
-}
-
-async fn connect(
-    config: &Config,
-    port: u16,
-    no_tunnel: bool,
-    no_open: bool,
-    sandbox: Option<String>,
-) -> Result<()> {
-    let alias = config.alias(sandbox.as_deref())?;
-    let local = (Ipv4Addr::LOCALHOST, port);
-    if !no_tunnel {
-        TcpListener::bind(local)
-            .await
-            .with_context(|| format!("local port {port} is unavailable"))?;
-    }
-    let response: PairResponse = send(
-        employee_request(config, Method::POST, &["v1", "me", "pair"])?.json(&PairRequest {
-            local_port: port,
-            label: format!("t3fleet {}", config.username),
-            sandbox_name: sandbox,
-        }),
-    )
-    .await?;
-    ensure!(
-        response.ssh_alias == alias && response.local_port == port,
-        "pairing response does not match the requested tunnel"
-    );
-
-    if no_tunnel {
-        println!(
-            "Pair in T3 Code using this URL\n{}\nOpen in T3 Code Desktop\n{}",
-            response.pair_url, response.t3_deep_link
-        );
-        println!("An SSH tunnel to 127.0.0.1:{port} is required to use these links.");
-        return Ok(());
-    }
-
-    let forward = format!("127.0.0.1:{port}:127.0.0.1:{}", config.server_t3_port);
-    let mut child = ssh(config)
-        .args([
-            "-N",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-L",
-            &forward,
-            &alias,
-        ])
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .context("starting SSH tunnel")?;
-
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-    tokio::select! {
-        result = &mut shutdown => { result?; child.kill().await?; return Ok(()); }
-        result = wait_for_tunnel(&mut child, port) => result?,
-    }
-
-    println!(
-        "Pair in T3 Code using this URL\n{}\nOpen in T3 Code Desktop\n{}",
-        response.pair_url, response.t3_deep_link
-    );
-    if !no_open && std::io::stdout().is_terminal() && open_pairing_link(&response.t3_deep_link) {
-        println!("Opening T3 Code Desktop. Click Confirm to add this sandbox.");
-    }
-    println!("Keep this terminal open while connected. Press Ctrl+C to close the tunnel.");
-    tokio::select! {
-        result = &mut shutdown => { result?; child.kill().await?; }
-        status = child.wait() => {
-            let status = status?;
-            ensure!(status.success(), "SSH tunnel exited with {status}");
-        }
-    }
-    Ok(())
-}
-
-/// Hands a `t3code://pair` link to the OS. Returns whether a handler was launched.
-fn open_pairing_link(link: &str) -> bool {
-    // The link comes from the server, so never pass any other URL to the OS opener.
-    if !link.starts_with("t3code://pair?") {
-        return false;
-    }
-    let Some(mut opener) = link_opener(link) else {
-        return false;
-    };
-    opener
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .is_ok()
-}
-
-#[cfg(target_os = "macos")]
-fn link_opener(link: &str) -> Option<Command> {
-    let mut command = Command::new("open");
-    command.arg(link);
-    Some(command)
-}
-
-#[cfg(windows)]
-fn link_opener(link: &str) -> Option<Command> {
-    // Unlike `cmd /c start`, this does not reinterpret `&` in the URL.
-    let mut command = Command::new("rundll32");
-    command.args(["url.dll,FileProtocolHandler", link]);
-    Some(command)
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-fn link_opener(link: &str) -> Option<Command> {
-    // Headless hosts have no desktop app to open.
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return None;
-    }
-    let mut command = Command::new("xdg-open");
-    command.arg(link);
-    Some(command)
-}
-
-async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .context("installing SIGTERM handler")?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            _ = sigterm.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
-}
-
-async fn wait_for_tunnel(child: &mut Child, port: u16) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            bail!("SSH tunnel exited before opening port {port} ({status})");
-        }
-        if TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "SSH tunnel did not open port {port} within 60 seconds"
-        );
-        sleep(Duration::from_millis(100)).await;
     }
 }

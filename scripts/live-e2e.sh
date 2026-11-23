@@ -125,31 +125,21 @@ BOB_ENV_ID="$(echo "$BOB_CHECK" | awk -F= '/^ENV_ID=/{print $2}')"
 [ "$ALICE_ENV_ID" != "$BOB_ENV_ID" ]
 pass "Alice ($ALICE_ENV_ID) and Bob ($BOB_ENV_ID) are on separate isolated Boat sandboxes with T3 Code bound strictly to 127.0.0.1:3773 and zero secret leaks"
 
-log "5. Verifying end-to-end T3 Code pairing & encrypted loopback tunnel (t3fleet connect)"
+log "5. Verifying T3 Code is reachable over the SSH route T3 Code Desktop uses"
 docker exec "$ALICE_CID" bash -lc '
   set -euo pipefail
-  t3fleet connect --port 13779 > /tmp/connect.out 2> /tmp/connect.err &
-  CPID=$!
-  trap "kill $CPID 2>/dev/null || true; wait $CPID 2>/dev/null || true" EXIT
+  ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:13779:127.0.0.1:3773 "t3fleet-'"$ALICE"'" &
+  SSH_PID=$!
+  trap "kill $SSH_PID 2>/dev/null || true; wait $SSH_PID 2>/dev/null || true" EXIT
   for _ in $(seq 1 60); do
-    if grep -q "Keep this terminal open" /tmp/connect.out 2>/dev/null; then
-      break
-    fi
+    curl -fsS -o /dev/null http://127.0.0.1:13779/.well-known/t3/environment && break
     sleep 0.5
   done
-  cat /tmp/connect.out
-  PAIR_URL="$(grep -E "^http://127\.0\.0\.1:13779/pair" /tmp/connect.out | head -n 1)"
-  DEEP_LINK="$(grep -E "^t3code://pair\?pairingUrl=" /tmp/connect.out | head -n 1)"
-  [ -n "$PAIR_URL" ]
-  [ -n "$DEEP_LINK" ]
   ENV_JSON="$(curl -fsS http://127.0.0.1:13779/.well-known/t3/environment)"
-  echo "TUNNELED_T3_ENV=$ENV_JSON"
+  echo "FORWARDED_T3_ENV=$ENV_JSON"
   echo "$ENV_JSON" | grep -q "environmentId"
-  HTTP_CODE="$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:13779/)"
-  echo "TUNNELED_HTTP=$HTTP_CODE"
-  [ "$HTTP_CODE" = "200" ]
 '
-pass "t3fleet connect opened private SSH tunnel, minted valid T3 pairing URL & t3code://pair deep link, and reached remote T3 server"
+pass "SSH host reaches the remote T3 Code server over a private loopback forward"
 
 log "5b. Verifying lightweight usage reporting, sandbox list, and SSH sync"
 docker exec "$ALICE_CID" t3fleet status --usage --json | jq -e '.usage.sandbox_id != null and (.usage.seconds >= 0)' >/dev/null

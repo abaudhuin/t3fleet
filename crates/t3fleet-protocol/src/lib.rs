@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const T3_PORT: u16 = 3773;
 pub const DEFAULT_SANDBOX_NAME: &str = "default";
 
 pub fn default_ssh_user() -> String {
@@ -87,7 +86,6 @@ pub struct EnrollResponse {
     #[serde(default = "default_ssh_user")]
     pub ssh_user: String,
     pub sandbox_id: String,
-    pub server_t3_port: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -222,24 +220,6 @@ pub struct SshTicketResponse {
     pub host_key: Option<String>,
     pub ssh_user: String,
     pub sandbox_id: String,
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct PairRequest {
-    pub local_port: u16,
-    pub label: String,
-    #[serde(default)]
-    pub sandbox_name: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct PairResponse {
-    pub pair_url: String,
-    pub t3_deep_link: String,
-    pub credential: String,
-    pub expires_at: DateTime<Utc>,
-    pub local_port: u16,
-    pub ssh_alias: String,
 }
 
 #[derive(Deserialize, Serialize)]

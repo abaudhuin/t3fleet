@@ -6,11 +6,11 @@
 
 Every provider implements a small, normalized surface:
 
-- **Identity & metadata:** `name() -> &'static str`, `capabilities() -> ProviderCapabilities`, `guest_user() -> GuestUser` (username + home directory used for T3 Code systemd bootstrap, `statev2.sqlite` idle probing, pairing, and client SSH config).
+- **Identity & metadata:** `name() -> &'static str`, `capabilities() -> ProviderCapabilities`, `guest_user() -> GuestUser` (username + home directory used for T3 Code systemd bootstrap, `statev2.sqlite` idle probing, and client SSH config).
 - **Lifecycle:** `create(CreateSandboxSpec)`, `get(id)`, `wait_for(id, stopped)` *(default polling impl)*, `resume(id, lease_ttl_secs) -> ResumeOutcome`, `suspend(id)`, `delete(id)`.
 - **Access & execution:**
   - `authorize_ssh(id, public_key) -> SshAccess { host, port, ssh_user, host_key: Option<String>, sandbox_id }`
-  - `exec(id, command, timeout) -> String` (runs a shell command inside the sandbox for bootstrap, idle checks, and `t3 auth pairing create`).
+  - `exec(id, command, timeout) -> String` (runs a shell command inside the sandbox for bootstrap and idle checks).
 
 Provider-specific states are normalized into `SandboxState`: `Starting`, `Running`, `Stopping`, `Stopped`, `Failed`.
 

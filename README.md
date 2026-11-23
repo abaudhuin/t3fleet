@@ -65,7 +65,7 @@ export T3FLEET_ADMIN_TOKEN=adm_...
 t3fleet admin user create alice --size small
 ```
 
-### 2. Developer: join & connect T3 Code
+### 2. Developer: join & add to T3 Code
 
 ```sh
 t3fleet join --server https://fleet.example.com --token enr_...
@@ -82,8 +82,6 @@ Then add the host to T3 Code Desktop once:
 
 T3 Code manages this connection itself. No terminal has to stay open, and reopening the app reconnects and wakes a sandbox that stopped while idle. After a manual `t3fleet stop`, run `t3fleet wake` first.
 
-If you cannot use T3 Code's SSH route, `t3fleet connect` is a fallback. It opens a loopback tunnel (`127.0.0.1:13773` → sandbox `127.0.0.1:3773`) and a one-time `t3code://pair` link (`--no-open` only prints it). Keep its terminal open while connected, and click **Confirm** each time.
-
 On Linux, T3 Code Desktop saves connections in the system keyring. A minimal desktop without a Secret Service such as `gnome-keyring` fails with "Could not register connection".
 
 ## Everyday commands
@@ -95,7 +93,6 @@ t3fleet status [--sandbox <name>] [--usage] [--json]
 t3fleet ssh [--sandbox <name>] [-- <command>...]
 t3fleet wake [--sandbox <name>]
 t3fleet stop [--sandbox <name>]
-t3fleet connect [--sandbox <name>] [--port 13773] [--no-tunnel] [--no-open]
 t3fleet sync                              # refresh local SSH entries for all your sandboxes
 ```
 
@@ -148,7 +145,7 @@ BOAT_API_KEY=boat_... ./scripts/build-template.sh team-base --setup ./scripts/te
 Choose how aggressively idle boxes stop and wake with `--wake-policy` (`T3FLEET_WAKE_POLICY`):
 
 - **`auto` *(default)*:** Stops sandboxes once disconnected and idle (`--idle-timeout-secs`, default 15 minutes). Wakes automatically when you reconnect over SSH, while respecting manual `t3fleet stop` and a short anti-flap cooldown (`--auto-wake-cooldown-secs`, default 2 minutes). Best when developers close T3 Code or sleep their laptops between sessions.
-- **`aggressive-idle`:** Stops idle sandboxes even if T3 Code Desktop is left open in the background with no active turns or recent thread activity. Passive SSH reconnects will not wake the box (preventing reconnect wake loops); wake explicitly with `t3fleet wake`, `t3fleet ssh`, or `t3fleet connect`.
+- **`aggressive-idle`:** Stops idle sandboxes even if T3 Code Desktop is left open in the background with no active turns or recent thread activity. Passive SSH reconnects will not wake the box (preventing reconnect wake loops); wake explicitly with `t3fleet wake` or `t3fleet ssh`.
 - **`explicit`:** Same work-aware auto-stop, and wakes only on explicit CLI commands.
 
 **14-day retention safety net:** By default (`--snapshot-retention-days 13`, `0` to disable), any sandbox stopped past day 13 is automatically saved to a Boat saved snapshot, transparently restored if the original stopped disk expires, and cleaned up once the sandbox is running again.
@@ -157,7 +154,7 @@ Choose how aggressively idle boxes stop and wake with `--wake-policy` (`T3FLEET_
 
 - **Private transport & least privilege:** Only `t3fleet-server` holds `BOAT_API_KEY`. Sandboxes are created with `noEnv: true`, T3 Code listens only on loopback (`127.0.0.1:3773`), SSH traffic goes directly from the developer's laptop to their sandbox with strict host-key pinning, and all server tokens are stored as SHA-256 hashes. Plain HTTP is blocked outside loopback and Tailscale unless `--allow-insecure-http` is passed.
 - **Revocation:** `admin user revoke` blocks new API/SSH ticket requests immediately; run `admin sandbox stop <user>` to also terminate an already-open SSH session.
-- **T3 Desktop onboarding & reconnects:** T3 Desktop discovers enrolled SSH hosts automatically, but adding a host still takes one manual step in **Settings → Environments → Add environment → SSH**. Because OpenSSH cannot distinguish T3 Desktop's background reconnect retries from a manual click, use `--wake-policy aggressive-idle` if your team leaves T3 Desktop open all day.
+- **T3 Desktop setup & reconnects:** T3 Desktop discovers enrolled SSH hosts automatically, but each developer adds theirs once in **Settings → Environments → Add environment → SSH**. Because OpenSSH cannot distinguish T3 Desktop's background reconnect retries from a manual click, use `--wake-policy aggressive-idle` if your team leaves T3 Desktop open all day.
 - **Provider logins:** Coding agent providers (`claude`, `codex`, etc.) are authenticated inside each sandbox or configured via your template/policy, same as any remote T3 Code host.
 
 ## Providers & development
