@@ -2,6 +2,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const T3_PORT: u16 = 3773;
+pub const DEFAULT_SANDBOX_NAME: &str = "default";
+
+pub fn valid_sandbox_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +46,8 @@ pub struct CreateUserRequest {
     pub username: String,
     #[serde(default)]
     pub sandbox_size: SandboxSize,
+    #[serde(default)]
+    pub template: Option<String>,
     #[serde(default = "provision_by_default")]
     pub provision_now: bool,
     #[serde(default = "default_invite_ttl")]
@@ -127,6 +138,33 @@ impl SandboxActivity {
 }
 
 #[derive(Deserialize, Serialize)]
+pub struct CreateSandboxRequest {
+    pub name: String,
+    #[serde(default)]
+    pub size: Option<SandboxSize>,
+    #[serde(default)]
+    pub template: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SandboxUsage {
+    pub sandbox_id: String,
+    pub sandbox_type: String,
+    pub seconds: u64,
+    pub dollars: f64,
+    pub running: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AdminUsageEntry {
+    pub username: String,
+    pub sandbox_name: String,
+    pub sandbox_id: String,
+    pub state: String,
+    pub usage: SandboxUsage,
+}
+
+#[derive(Deserialize, Serialize)]
 pub struct StatusResponse {
     pub username: String,
     pub sandbox_size: String,
@@ -142,6 +180,12 @@ pub struct StatusResponse {
     pub stopped_reason: Option<String>,
     #[serde(default)]
     pub activity: Option<SandboxActivity>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub preserved_snapshot: Option<String>,
+    #[serde(default)]
+    pub usage: Option<SandboxUsage>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -155,6 +199,8 @@ pub enum WakeIntent {
 pub struct SshTicketRequest {
     pub ssh_public_key: String,
     pub intent: WakeIntent,
+    #[serde(default)]
+    pub sandbox_name: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -170,6 +216,8 @@ pub struct SshTicketResponse {
 pub struct PairRequest {
     pub local_port: u16,
     pub label: String,
+    #[serde(default)]
+    pub sandbox_name: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]

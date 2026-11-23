@@ -50,6 +50,12 @@ struct Args {
     wake_policy: PolicyArg,
     #[arg(long, env = "T3FLEET_SKIP_BOOTSTRAP")]
     skip_bootstrap: bool,
+    #[arg(long, env = "T3FLEET_MAX_SANDBOXES_PER_USER", default_value_t = 5)]
+    max_sandboxes_per_user: usize,
+    #[arg(long, env = "T3FLEET_DEFAULT_TEMPLATE")]
+    default_template: Option<String>,
+    #[arg(long, env = "T3FLEET_SNAPSHOT_RETENTION_DAYS", default_value_t = 13)]
+    snapshot_retention_days: u64,
 }
 
 #[tokio::main]
@@ -70,6 +76,9 @@ async fn main() -> Result<()> {
         cooldown: Duration::from_secs(args.auto_wake_cooldown_secs),
         wake_policy: args.wake_policy.into(),
         skip_bootstrap: args.skip_bootstrap,
+        max_sandboxes_per_user: args.max_sandboxes_per_user,
+        default_template: args.default_template,
+        snapshot_retention_days: args.snapshot_retention_days,
     })?;
     if let Some(token) = generated_token {
         eprintln!("Initial t3fleet admin token: {token}");

@@ -151,6 +151,13 @@ docker exec "$ALICE_CID" bash -lc '
 '
 pass "t3fleet connect opened private SSH tunnel, minted valid T3 pairing URL & t3code://pair deep link, and reached remote T3 server"
 
+log "5b. Verifying lightweight usage reporting, sandbox list, and SSH sync"
+docker exec "$ALICE_CID" t3fleet status --usage --json | jq -e '.usage.sandbox_id != null and (.usage.seconds >= 0)' >/dev/null
+docker exec "$ALICE_CID" t3fleet sandbox list --json | jq -e 'length == 1 and .[0].sandbox_name == "default"' >/dev/null
+docker exec "$ALICE_CID" t3fleet sync
+"$CLI_BIN" admin usage --server "$SERVER_URL" --admin-token "$ADMIN_TOKEN" --json | jq -e 'length >= 2' >/dev/null
+pass "Usage reporting, sandbox list, and SSH fragment sync verified against live Boat API"
+
 log "6. Verifying manual stop, anti-flap passive ssh-proxy rejection, resume, and rotated host-key pinning"
 docker exec "$ALICE_CID" t3fleet stop
 docker exec "$ALICE_CID" t3fleet status --json | jq -e '.state == "archived" and .stopped_reason == "manual"' >/dev/null

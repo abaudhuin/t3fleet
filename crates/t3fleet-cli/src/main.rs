@@ -2,8 +2,7 @@ mod api;
 mod config;
 
 use std::{
-    net::Ipv4Addr,
-    os::unix::process::ExitStatusExt,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     pin::Pin,
     process::{ExitCode, ExitStatus, Stdio},
@@ -11,11 +10,14 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
 use anyhow::{Context, Result, bail, ensure};
 use api::{Api, send};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::Config;
-use reqwest::Method;
+use reqwest::{Method, RequestBuilder};
 use serde::Serialize;
 use serde_json::Value;
 use t3fleet_protocol::*;
@@ -42,10 +44,22 @@ enum Action {
     Status {
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        sandbox: Option<String>,
+        #[arg(long)]
+        usage: bool,
     },
-    Wake,
-    Stop,
+    Wake {
+        #[arg(long)]
+        sandbox: Option<String>,
+    },
+    Stop {
+        #[arg(long)]
+        sandbox: Option<String>,
+    },
     Ssh {
+        #[arg(long)]
+        sandbox: Option<String>,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -54,13 +68,38 @@ enum Action {
         port: u16,
         #[arg(long)]
         no_tunnel: bool,
+        #[arg(long)]
+        sandbox: Option<String>,
     },
+    Sandbox {
+        #[command(subcommand)]
+        action: EmployeeSandboxAction,
+    },
+    Sync,
     #[command(hide = true)]
     SshProxy {
         #[arg(long)]
         alias: String,
     },
     Admin(Admin),
+}
+
+#[derive(Subcommand)]
+enum EmployeeSandboxAction {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    New {
+        name: String,
+        #[arg(long, value_enum)]
+        size: Option<Size>,
+        #[arg(long)]
+        template: Option<String>,
+    },
+    Rm {
+        name: String,
+    },
 }
 
 #[derive(Args)]
@@ -106,6 +145,10 @@ enum AdminResource {
         #[command(subcommand)]
         action: SandboxAction,
     },
+    Usage {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -131,6 +174,8 @@ enum UserAction {
         username: String,
         #[arg(long, value_enum, default_value = "small")]
         size: Size,
+        #[arg(long)]
+        template: Option<String>,
         #[arg(long)]
         no_provision: bool,
         #[arg(long, default_value_t = default_invite_ttl())]
@@ -161,8 +206,16 @@ enum UserAction {
 
 #[derive(Subcommand)]
 enum SandboxAction {
-    Wake { username: String },
-    Stop { username: String },
+    Wake {
+        username: String,
+        #[arg(long)]
+        sandbox: Option<String>,
+    },
+    Stop {
+        username: String,
+        #[arg(long)]
+        sandbox: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -203,11 +256,12 @@ impl Cli {
             Some(path) => path,
             None => config::default_dir()?.join("config.toml"),
         };
+        let path = config::absolute(path)?;
         let config = Config::read(&path)?;
         match action {
-            Action::Ssh { command } => {
+            Action::Ssh { sandbox, command } => {
                 let status = ssh(&config)
-                    .arg(&config.ssh_alias)
+                    .arg(config.alias(sandbox.as_deref())?)
                     .args(command)
                     .status()
                     .await
@@ -215,13 +269,32 @@ impl Cli {
                 return Ok(exit_code(status));
             }
             Action::SshProxy { alias } => proxy(&config, &alias).await?,
-            Action::Connect { port, no_tunnel } => connect(&config, port, no_tunnel).await?,
-            Action::Status { json } => {
-                let status = employee(&config, Method::GET, "status").await?;
+            Action::Connect {
+                port,
+                no_tunnel,
+                sandbox,
+            } => {
+                connect(&config, port, no_tunnel, sandbox).await?;
+            }
+            Action::Status {
+                json,
+                sandbox,
+                usage,
+            } => {
+                let status = send(
+                    sandbox_request(&config, Method::GET, "status", sandbox.as_deref())?
+                        .query(&[("include_usage", usage)]),
+                )
+                .await?;
                 print_status(&status, json)?;
             }
-            Action::Wake => print_status(&employee(&config, Method::POST, "wake").await?, false)?,
-            Action::Stop => print_status(&employee(&config, Method::POST, "stop").await?, false)?,
+            Action::Wake { sandbox } => change_state(&config, "wake", sandbox.as_deref()).await?,
+            Action::Stop { sandbox } => change_state(&config, "stop", sandbox.as_deref()).await?,
+            Action::Sandbox { action } => employee_sandbox(&config, &path, action).await?,
+            Action::Sync => {
+                let count = sync_ssh(&config, &path).await?;
+                println!("Synced {count} SSH host(s)");
+            }
             Action::Join(_) | Action::Admin(_) => unreachable!(),
         }
         Ok(0)
@@ -289,7 +362,11 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
         known_hosts,
     };
     config.write(&config_path)?;
-    config::write_ssh(&config, &config_path, &dir)?;
+    config::write_ssh(&config, &config_path, &config.ssh_alias)?;
+    config::include_ssh(&config)?;
+    if let Err(error) = sync_ssh(&config, &config_path).await {
+        eprintln!("Could not sync all SSH hosts: {error:#}. Run 't3fleet sync' to retry.");
+    }
     println!(
         "Joined as {}. SSH host {}",
         config.username, config.ssh_alias
@@ -297,13 +374,114 @@ async fn join(args: Join, config_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn employee(config: &Config, method: Method, action: &str) -> Result<StatusResponse> {
+fn employee_request(config: &Config, method: Method, segments: &[&str]) -> Result<RequestBuilder> {
     let api = Api::new(&config.server, true)?;
-    send(
-        api.request(method, &["v1", "me", action])
-            .bearer_auth(&config.api_token),
-    )
+    Ok(api.request(method, segments).bearer_auth(&config.api_token))
+}
+
+fn with_sandbox(request: RequestBuilder, sandbox: Option<&str>) -> RequestBuilder {
+    match sandbox {
+        Some(name) => request.query(&[("sandbox", name)]),
+        None => request,
+    }
+}
+
+fn sandbox_request(
+    config: &Config,
+    method: Method,
+    action: &str,
+    sandbox: Option<&str>,
+) -> Result<RequestBuilder> {
+    Ok(with_sandbox(
+        employee_request(config, method, &["v1", "me", action])?,
+        sandbox,
+    ))
+}
+
+async fn change_state(config: &Config, action: &str, sandbox: Option<&str>) -> Result<()> {
+    let status = send(sandbox_request(config, Method::POST, action, sandbox)?).await?;
+    print_status(&status, false)
+}
+
+async fn list_sandboxes(config: &Config) -> Result<Vec<StatusResponse>> {
+    send(employee_request(
+        config,
+        Method::GET,
+        &["v1", "me", "sandboxes"],
+    )?)
     .await
+}
+
+fn status_alias(config: &Config, status: &StatusResponse) -> Result<String> {
+    let alias = config.alias(status.sandbox_name.as_deref())?;
+    ensure!(
+        status.ssh_alias.as_deref() == Some(&alias),
+        "unexpected SSH alias from fleet server"
+    );
+    Ok(alias)
+}
+
+async fn sync_ssh(config: &Config, config_path: &Path) -> Result<usize> {
+    let statuses = list_sandboxes(config).await?;
+    let aliases = statuses
+        .iter()
+        .map(|status| status_alias(config, status))
+        .collect::<Result<Vec<_>>>()?;
+    for alias in &aliases {
+        config::write_ssh(config, config_path, alias)?;
+    }
+    config::include_ssh(config)?;
+    config::prune_ssh(config, &aliases)?;
+    Ok(aliases.len())
+}
+
+async fn employee_sandbox(
+    config: &Config,
+    config_path: &Path,
+    action: EmployeeSandboxAction,
+) -> Result<()> {
+    match action {
+        EmployeeSandboxAction::List { json: machine } => {
+            let statuses = list_sandboxes(config).await?;
+            if machine {
+                return json(&statuses);
+            }
+            for status in statuses {
+                print_status(&status, false)?;
+            }
+        }
+        EmployeeSandboxAction::New {
+            name,
+            size,
+            template,
+        } => {
+            let status: StatusResponse = send(
+                employee_request(config, Method::POST, &["v1", "me", "sandboxes"])?.json(
+                    &CreateSandboxRequest {
+                        name,
+                        size: size.map(Into::into),
+                        template,
+                    },
+                ),
+            )
+            .await?;
+            let alias = status_alias(config, &status)?;
+            config::write_ssh(config, config_path, &alias)?;
+            println!("SSH host {alias}");
+        }
+        EmployeeSandboxAction::Rm { name } => {
+            let alias = config.alias(Some(&name))?;
+            let _: Value = send(employee_request(
+                config,
+                Method::DELETE,
+                &["v1", "me", "sandboxes", &name],
+            )?)
+            .await?;
+            config::remove_ssh(config, &alias)?;
+            println!("Deleted sandbox {name}");
+        }
+    }
+    Ok(())
 }
 
 fn json(value: &impl Serialize) -> Result<()> {
@@ -315,11 +493,15 @@ fn print_status(status: &StatusResponse, machine: bool) -> Result<()> {
     if machine {
         return json(status);
     }
-    print!(
-        "{}  {}",
-        status.username,
-        status.state.as_deref().unwrap_or("not provisioned")
-    );
+    print!("{}", status.username);
+    if let Some(name) = status
+        .sandbox_name
+        .as_deref()
+        .filter(|name| *name != DEFAULT_SANDBOX_NAME)
+    {
+        print!("/{name}");
+    }
+    print!("  {}", status.state.as_deref().unwrap_or("not provisioned"));
     if let Some(id) = &status.sandbox_id {
         print!("  {id}");
     }
@@ -336,8 +518,19 @@ fn print_status(status: &StatusResponse, machine: bool) -> Result<()> {
             activity.t3_http_conns
         );
     }
+    if let Some(usage) = &status.usage {
+        print!("  {}", format_usage(usage));
+    }
     println!();
     Ok(())
+}
+
+fn format_usage(usage: &SandboxUsage) -> String {
+    format!(
+        "{:.2} billable hours  ${:.4}",
+        usage.seconds as f64 / 3600.0,
+        usage.dollars
+    )
 }
 
 fn print_invite(invite: &InviteResponse, machine: bool) -> Result<()> {
@@ -367,6 +560,7 @@ async fn admin(args: Admin) -> Result<()> {
             UserAction::Create {
                 username,
                 size,
+                template,
                 no_provision,
                 invite_ttl_secs,
                 json,
@@ -375,6 +569,7 @@ async fn admin(args: Admin) -> Result<()> {
                     &CreateUserRequest {
                         username,
                         sandbox_size: size.into(),
+                        template,
                         provision_now: !no_provision,
                         invite_ttl_secs,
                     },
@@ -429,23 +624,43 @@ async fn admin(args: Admin) -> Result<()> {
             }
         },
         AdminResource::Sandbox { action } => {
-            let (username, action) = match action {
-                SandboxAction::Wake { username } => (username, "wake"),
-                SandboxAction::Stop { username } => (username, "stop"),
+            let (username, sandbox, action) = match action {
+                SandboxAction::Wake { username, sandbox } => (username, sandbox, "wake"),
+                SandboxAction::Stop { username, sandbox } => (username, sandbox, "stop"),
             };
-            let status = send(request(
-                Method::POST,
-                &["v1", "admin", "sandboxes", &username, action],
+            let status = send(with_sandbox(
+                request(
+                    Method::POST,
+                    &["v1", "admin", "sandboxes", &username, action],
+                ),
+                sandbox.as_deref(),
             ))
             .await?;
             print_status(&status, false)?;
+        }
+        AdminResource::Usage { json: machine } => {
+            let entries: Vec<AdminUsageEntry> =
+                send(request(Method::GET, &["v1", "admin", "usage"])).await?;
+            if machine {
+                return json(&entries);
+            }
+            for entry in entries {
+                println!(
+                    "{}/{}  {}  {}  {}",
+                    entry.username,
+                    entry.sandbox_name,
+                    entry.state,
+                    entry.sandbox_id,
+                    format_usage(&entry.usage)
+                );
+            }
         }
     }
     Ok(())
 }
 
 fn ssh(config: &Config) -> Command {
-    let mut command = Command::new("ssh");
+    let mut command = Command::new(config::SSH_PROGRAM);
     command
         .arg("-F")
         .arg(&config.ssh_config)
@@ -454,39 +669,35 @@ fn ssh(config: &Config) -> Command {
 }
 
 fn exit_code(status: ExitStatus) -> u8 {
-    status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal))
-        .unwrap_or(1) as u8
+    let code = status.code();
+    #[cfg(unix)]
+    let code = code.or_else(|| status.signal().map(|signal| 128 + signal));
+    code.unwrap_or(1) as u8
 }
 
 async fn proxy(config: &Config, alias: &str) -> Result<()> {
-    ensure!(
-        alias == config.ssh_alias,
-        "SSH alias does not match fleet configuration"
-    );
-    config::validate_alias(alias)?;
+    let sandbox_name = config.sandbox_name(alias)?.map(str::to_owned);
     let intent = if std::env::var("T3FLEET_WAKE_INTENT").as_deref() == Ok("explicit") {
         WakeIntent::Explicit
     } else {
         WakeIntent::SshProxy
     };
-    let api = Api::new(&config.server, true)?;
     let ticket: SshTicketResponse = send(
-        api.request(Method::POST, &["v1", "me", "ssh-ticket"])
-            .bearer_auth(&config.api_token)
-            .json(&SshTicketRequest {
+        employee_request(config, Method::POST, &["v1", "me", "ssh-ticket"])?.json(
+            &SshTicketRequest {
                 ssh_public_key: config.public_key()?,
                 intent,
-            }),
+                sandbox_name,
+            },
+        ),
     )
     .await?;
     ensure!(ticket.ssh_user == "user", "unexpected Boat SSH user");
     ensure!(
-        ticket.sandbox_id == config.sandbox_id,
-        "ticket sandbox does not match fleet configuration"
+        ticket.port != 0 && valid_ssh_host(&ticket.host),
+        "invalid Boat SSH endpoint"
     );
-    config::pin_host(&config.known_hosts, alias, &ticket.host_key)?;
+    config::pin_host(&config.known_hosts_for(alias)?, alias, &ticket.host_key)?;
     let socket = tokio::time::timeout(
         Duration::from_secs(20),
         TcpStream::connect((ticket.host.as_str(), ticket.port)),
@@ -495,6 +706,23 @@ async fn proxy(config: &Config, alias: &str) -> Result<()> {
     .context("timed out connecting to Boat SSH endpoint")?
     .context("connecting to Boat SSH endpoint")?;
     relay(socket).await
+}
+
+fn valid_ssh_host(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
+        || (host.len() <= 253
+            && host
+                .strip_suffix('.')
+                .unwrap_or(host)
+                .split('.')
+                .all(|label| {
+                    (1..=63).contains(&label.len())
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                }))
 }
 
 async fn relay(mut socket: TcpStream) -> Result<()> {
@@ -542,25 +770,29 @@ impl AsyncWrite for ProxyOutput {
     }
 }
 
-async fn connect(config: &Config, port: u16, no_tunnel: bool) -> Result<()> {
+async fn connect(
+    config: &Config,
+    port: u16,
+    no_tunnel: bool,
+    sandbox: Option<String>,
+) -> Result<()> {
+    let alias = config.alias(sandbox.as_deref())?;
     let local = (Ipv4Addr::LOCALHOST, port);
     if !no_tunnel {
         TcpListener::bind(local)
             .await
             .with_context(|| format!("local port {port} is unavailable"))?;
     }
-    let api = Api::new(&config.server, true)?;
     let response: PairResponse = send(
-        api.request(Method::POST, &["v1", "me", "pair"])
-            .bearer_auth(&config.api_token)
-            .json(&PairRequest {
-                local_port: port,
-                label: format!("t3fleet {}", config.username),
-            }),
+        employee_request(config, Method::POST, &["v1", "me", "pair"])?.json(&PairRequest {
+            local_port: port,
+            label: format!("t3fleet {}", config.username),
+            sandbox_name: sandbox,
+        }),
     )
     .await?;
     ensure!(
-        response.ssh_alias == config.ssh_alias && response.local_port == port,
+        response.ssh_alias == alias && response.local_port == port,
         "pairing response does not match the requested tunnel"
     );
 
@@ -581,21 +813,14 @@ async fn connect(config: &Config, port: u16, no_tunnel: bool) -> Result<()> {
             "ExitOnForwardFailure=yes",
             "-L",
             &forward,
-            &config.ssh_alias,
+            &alias,
         ])
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .context("starting SSH tunnel")?;
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("installing SIGTERM handler")?;
-    let shutdown = async {
-        tokio::select! {
-            res = tokio::signal::ctrl_c() => res,
-            _ = sigterm.recv() => Ok(()),
-        }
-    };
+    let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     tokio::select! {
         result = &mut shutdown => { result?; child.kill().await?; return Ok(()); }
@@ -614,6 +839,21 @@ async fn connect(config: &Config, port: u16, no_tunnel: bool) -> Result<()> {
             ensure!(status.success(), "SSH tunnel exited with {status}");
         }
     }
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("installing SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 

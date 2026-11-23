@@ -1,0 +1,6 @@
+# Example Caddy reverse proxy for HTTPS in front of t3fleet-server.
+# Alternatively, bind t3fleet-server directly to your Tailscale IP (100.x.y.z:8080)
+# or expose it privately with `tailscale serve --bg http://127.0.0.1:8080`.
+fleet.example.com {
+    reverse_proxy 127.0.0.1:8080
+}

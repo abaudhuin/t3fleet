@@ -1,19 +1,29 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{TimeDelta, Utc};
 use serde::Deserialize;
-use t3fleet_protocol::{PairRequest, PairResponse, SandboxActivity, WakeIntent, WakePolicy};
+use t3fleet_protocol::{
+    DEFAULT_SANDBOX_NAME, PairRequest, PairResponse, SandboxActivity, StatusResponse, WakeIntent,
+    WakePolicy,
+};
+use tokio::time::sleep;
+use uuid::Uuid;
 
 use crate::{
     ApiError, App,
-    boat::RemoteSandbox,
-    db::{Sandbox, User},
+    boat::{RemoteSandbox, ResumeOutcome, SnapshotStatus},
+    db::{self, Sandbox, User},
 };
 
 const WAIT_FOR_T3: &str = r#"timeout 25 sh -c 'until ss -Htl "sport = :3773" 2>/dev/null | grep -q . || curl -sS --max-time 1 -o /dev/null http://127.0.0.1:3773/ 2>/dev/null; do sleep 1; done'"#;
 
+pub(crate) const RETENTION_SNAPSHOT_PREFIX: &str = "t3fleet-keep-";
+
 const BOOTSTRAP: &str = r#"set -eu
+if [ -x /home/user/.local/bin/t3 ] && systemctl is-active --quiet t3code; then
+    exit 0
+fi
 if [ ! -x /home/user/.local/bin/t3 ]; then
     if [ "$(id -un)" = "user" ]; then
         env HOME=/home/user bash -o pipefail -c 'curl -fsSL https://t3.codes/install.sh | sh'
@@ -116,20 +126,27 @@ struct Pairing {
     expires_at: chrono::DateTime<Utc>,
 }
 
+fn retention_snapshot_name(boat_id: &str) -> String {
+    format!("{RETENTION_SNAPSHOT_PREFIX}{}", boat_id.replace('_', "-"))
+}
+
 fn elapsed(time: chrono::DateTime<Utc>) -> Duration {
     (Utc::now() - time).to_std().unwrap_or_default()
 }
 
 impl App {
-    async fn sync(&self, sandbox: &mut Sandbox) -> Result<RemoteSandbox> {
-        let remote = self.boat.get(&sandbox.boat_id).await?;
+    async fn sync(&self, sandbox: &mut Sandbox) -> Result<Option<RemoteSandbox>> {
+        let Some(remote) = self.boat.get(&sandbox.boat_id).await? else {
+            ensure!(sandbox.state == "archived", "Boat sandbox not found");
+            return Ok(None);
+        };
         if remote.state == "archived" {
             self.record_stop(sandbox, None, &remote)?;
         } else if sandbox.state != remote.state {
             sandbox.state.clone_from(&remote.state);
             self.db.save_sandbox(sandbox)?;
         }
-        Ok(remote)
+        Ok(Some(remote))
     }
 
     fn record_stop(
@@ -163,30 +180,82 @@ impl App {
         Ok(())
     }
 
-    pub(crate) async fn status(&self, user: User) -> Result<t3fleet_protocol::StatusResponse> {
-        if let Some(mut sandbox) = self.db.sandbox(&user)? {
-            self.sync(&mut sandbox).await?;
+    pub(crate) async fn sandbox_status(
+        &self,
+        user: &User,
+        mut sandbox: Option<Sandbox>,
+        include_usage: bool,
+    ) -> Result<StatusResponse> {
+        let mut usage = None;
+        if let Some(sandbox) = sandbox.as_mut().filter(|sandbox| sandbox.provisioned()) {
+            self.sync(sandbox).await?;
+            if include_usage {
+                usage = self.boat.usage(&sandbox.boat_id).await?;
+            }
         }
-        Ok(self.db.status(user, self.wake_policy)?)
+        let mut status = db::status(user, sandbox, self.wake_policy);
+        status.usage = usage;
+        Ok(status)
     }
 
-    pub(crate) async fn ready(&self, user: &User, intent: WakeIntent) -> Result<Sandbox, ApiError> {
-        let mut sandbox = match self.db.sandbox(user)? {
+    pub(crate) async fn ready(
+        &self,
+        user: &User,
+        name: &str,
+        intent: WakeIntent,
+    ) -> Result<Sandbox, ApiError> {
+        let sandbox = match self.db.sandbox(user, name)? {
             Some(sandbox) => sandbox,
-            None => {
-                let remote = self.boat.create(user, self.safety_ttl).await?;
-                self.db.add_sandbox(user, &remote.id, &remote.state)?;
-                self.db
-                    .sandbox(user)?
-                    .context("created sandbox missing from SQLite")?
-            }
+            None if name == DEFAULT_SANDBOX_NAME => self
+                .db
+                .reserve_sandbox(
+                    user,
+                    name,
+                    &user.size,
+                    user.template
+                        .as_deref()
+                        .or(self.default_template.as_deref()),
+                )?
+                .ok_or_else(|| ApiError::conflict("SSH alias is already in use"))?,
+            None => return Err(ApiError::sandbox_not_found()),
         };
-        let mut remote = self.sync(&mut sandbox).await?;
-        if remote.stopping() && sandbox.stopped_reason.is_some() {
-            remote = self.boat.wait_for(&sandbox.boat_id, true).await?;
-            self.record_stop(&mut sandbox, None, &remote)?;
+        self.start_sandbox(user, sandbox, intent).await
+    }
+
+    pub(crate) async fn start_sandbox(
+        &self,
+        user: &User,
+        mut sandbox: Sandbox,
+        intent: WakeIntent,
+    ) -> Result<Sandbox, ApiError> {
+        let mut remote = if sandbox.provisioned() {
+            self.sync(&mut sandbox).await?
+        } else {
+            let remote = self
+                .boat
+                .create(
+                    &user.username,
+                    &sandbox,
+                    self.safety_ttl,
+                    sandbox.template.as_deref(),
+                    &sandbox.id,
+                )
+                .await?;
+            sandbox.boat_id.clone_from(&remote.id);
+            sandbox.state.clone_from(&remote.state);
+            self.db.save_sandbox(&sandbox)?;
+            Some(remote)
+        };
+        if remote.as_ref().is_some_and(RemoteSandbox::stopping) && sandbox.stopped_reason.is_some()
+        {
+            let archived = self.boat.wait_for(&sandbox.boat_id, true).await?;
+            self.record_stop(&mut sandbox, None, &archived)?;
+            remote = Some(archived);
         }
-        if remote.state == "archived" {
+        if remote
+            .as_ref()
+            .is_none_or(|remote| remote.state == "archived")
+        {
             if matches!(intent, WakeIntent::SshProxy) {
                 match self.wake_policy {
                     WakePolicy::Explicit => {
@@ -219,10 +288,15 @@ impl App {
                     },
                 }
             }
-            self.boat.resume(&sandbox.boat_id, self.safety_ttl).await?;
-        } else if !remote.running() {
+            match self.boat.resume(&sandbox.boat_id, self.safety_ttl).await? {
+                ResumeOutcome::Ready(remote) => sandbox.state = remote.state,
+                ResumeOutcome::Expired => self.restore(user, &mut sandbox).await?,
+            }
+        } else if remote.is_some_and(|remote| !remote.running()) {
             self.boat.wait_for(&sandbox.boat_id, false).await?;
         }
+
+        self.cleanup_snapshot(&mut sandbox).await?;
 
         if sandbox.bootstrapped_at.is_none() && !self.skip_bootstrap {
             let command = format!("{BOOTSTRAP}{WAIT_FOR_T3}");
@@ -233,18 +307,117 @@ impl App {
         Ok(sandbox)
     }
 
+    async fn restore(&self, user: &User, sandbox: &mut Sandbox) -> Result<()> {
+        let snapshot = sandbox
+            .preserved_snapshot
+            .as_deref()
+            .filter(|name| *name == retention_snapshot_name(&sandbox.boat_id))
+            .context("Boat's archived sandbox expired without a saved snapshot")?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let saved = self
+                    .boat
+                    .saved_snapshot(snapshot)
+                    .await?
+                    .context("preserved Boat snapshot is missing")?;
+                ensure!(
+                    saved.belongs_to(&sandbox.boat_id),
+                    "saved snapshot belongs to a different sandbox"
+                );
+                ensure!(
+                    saved
+                        .created_at
+                        .zip(sandbox.stopped_at)
+                        .is_none_or(|(created, stopped)| created >= stopped),
+                    "saved snapshot predates the sandbox's last stop"
+                );
+                match saved.status {
+                    SnapshotStatus::Ready => return Ok(()),
+                    SnapshotStatus::Failed => bail!(
+                        "Boat could not preserve sandbox snapshot: {}",
+                        saved.error.as_deref().unwrap_or("unknown error"),
+                    ),
+                    SnapshotStatus::Saving => sleep(Duration::from_secs(1)).await,
+                }
+            }
+        })
+        .await
+        .context("Boat snapshot is still saving; retry wake shortly")??;
+        let key = match &sandbox.restore_key {
+            Some(key) => key.clone(),
+            None => {
+                let key = Uuid::new_v4().to_string();
+                sandbox.restore_key = Some(key.clone());
+                self.db.save_sandbox(sandbox)?;
+                key
+            }
+        };
+        let restored = self
+            .boat
+            .create(
+                &user.username,
+                sandbox,
+                self.safety_ttl,
+                Some(snapshot),
+                &key,
+            )
+            .await?;
+        let remote = if restored.running() {
+            restored
+        } else {
+            self.boat.wait_for(&restored.id, false).await?
+        };
+        let old_id = std::mem::replace(&mut sandbox.boat_id, remote.id);
+        sandbox.state = remote.state;
+        sandbox.restore_key = None;
+        sandbox.last_activity = None;
+        self.db.save_sandbox(sandbox)?;
+        if old_id != sandbox.boat_id
+            && let Err(error) = self.boat.delete(&old_id).await
+        {
+            tracing::warn!(sandbox_id = %old_id, %error, "could not delete expired sandbox");
+        }
+        Ok(())
+    }
+
+    async fn cleanup_snapshot(&self, sandbox: &mut Sandbox) -> Result<()> {
+        if let Some(snapshot) = &sandbox.preserved_snapshot {
+            match self.boat.delete_saved_snapshot(snapshot).await {
+                Ok(()) => {
+                    sandbox.preserved_snapshot = None;
+                    sandbox.restore_key = None;
+                    self.db.save_sandbox(sandbox)?;
+                }
+                Err(error) => {
+                    tracing::warn!(%snapshot, %error, "could not clean up saved snapshot")
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn prepare_enrollment(&self, user: &User) -> Result<Sandbox, ApiError> {
-        if let Some(mut sandbox) = self.db.sandbox(user)?
+        if let Some(mut sandbox) = self.db.sandbox(user, DEFAULT_SANDBOX_NAME)?
+            && sandbox.provisioned()
             && (self.skip_bootstrap || sandbox.bootstrapped_at.is_some())
-            && self.sync(&mut sandbox).await?.state == "archived"
+            && self
+                .sync(&mut sandbox)
+                .await?
+                .is_none_or(|remote| remote.state == "archived")
         {
             return Ok(sandbox);
         }
-        self.ready(user, WakeIntent::Explicit).await
+        self.ready(user, DEFAULT_SANDBOX_NAME, WakeIntent::Explicit)
+            .await
     }
 
     pub(crate) async fn stop(&self, sandbox: &mut Sandbox, reason: &str) -> Result<()> {
-        let remote = self.sync(sandbox).await?;
+        if !sandbox.provisioned() {
+            return Ok(());
+        }
+        let Some(remote) = self.sync(sandbox).await? else {
+            return Ok(());
+        };
         if remote.state == "archived" {
             return self.record_stop(sandbox, Some(reason), &remote);
         }
@@ -255,6 +428,17 @@ impl App {
         self.db.save_sandbox(sandbox)?;
         let remote = self.boat.wait_for(&sandbox.boat_id, true).await?;
         self.record_stop(sandbox, Some(reason), &remote)
+    }
+
+    pub(crate) async fn delete_sandbox(&self, user: &User, sandbox: Sandbox) -> Result<()> {
+        if let Some(snapshot) = &sandbox.preserved_snapshot {
+            self.boat.delete_saved_snapshot(snapshot).await?;
+        }
+        if sandbox.provisioned() {
+            self.boat.delete(&sandbox.boat_id).await?;
+        }
+        self.db.delete_sandbox(user, &sandbox.name)?;
+        Ok(())
     }
 
     pub(crate) async fn pairing(
@@ -294,17 +478,15 @@ impl App {
         })
     }
 
-    pub(crate) async fn check_idle(&self, user: &User) -> Result<()> {
-        let Some(mut sandbox) = self.db.sandbox(user)? else {
+    pub(crate) async fn watch_sandbox(&self, mut sandbox: Sandbox) -> Result<()> {
+        let remote = self.sync(&mut sandbox).await?;
+        if sandbox.state == "archived" {
+            return self.preserve_snapshot(&mut sandbox).await;
+        }
+        let Some(remote) = remote.filter(RemoteSandbox::running) else {
             return Ok(());
         };
-        if !matches!(sandbox.state.as_str(), "ready" | "idle" | "running") {
-            return Ok(());
-        }
-        let remote = self.sync(&mut sandbox).await?;
-        if !remote.running() {
-            return Ok(());
-        }
+        self.cleanup_snapshot(&mut sandbox).await?;
 
         let output = self.boat.command(&sandbox.boat_id, PROBE, 15).await?;
         let activity: SandboxActivity =
@@ -337,6 +519,36 @@ impl App {
         } else {
             self.db.save_sandbox(&sandbox)?;
         }
+        Ok(())
+    }
+
+    async fn preserve_snapshot(&self, sandbox: &mut Sandbox) -> Result<()> {
+        let retention = self.snapshot_retention_days.saturating_mul(86_400);
+        if retention == 0
+            || sandbox
+                .stopped_at
+                .is_none_or(|at| elapsed(at).as_secs() < retention)
+        {
+            return Ok(());
+        }
+        let name = retention_snapshot_name(&sandbox.boat_id);
+        if let Some(existing) = &sandbox.preserved_snapshot
+            && let Some(snapshot) = self.boat.saved_snapshot(existing).await?
+        {
+            let current = *existing == name
+                && snapshot.belongs_to(&sandbox.boat_id)
+                && snapshot
+                    .created_at
+                    .zip(sandbox.stopped_at)
+                    .is_none_or(|(created, stopped)| created >= stopped);
+            if current && !matches!(snapshot.status, SnapshotStatus::Failed) {
+                return Ok(());
+            }
+            self.boat.delete_saved_snapshot(existing).await?;
+        }
+        self.boat.save_snapshot(&sandbox.boat_id, &name).await?;
+        sandbox.preserved_snapshot = Some(name);
+        self.db.save_sandbox(sandbox)?;
         Ok(())
     }
 }

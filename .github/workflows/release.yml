@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            bins: "t3fleet t3fleet-server"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            bins: "t3fleet t3fleet-server"
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            bins: "t3fleet t3fleet-server"
+          - os: macos-14
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            bins: "t3fleet t3fleet-server"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            bins: "t3fleet.exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binaries
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo build --release --target ${{ matrix.target }} --bin t3fleet
+          else
+            cargo build --release --target ${{ matrix.target }} --bin t3fleet --bin t3fleet-server
+          fi
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist stage
+          for bin in ${{ matrix.bins }}; do
+            cp "target/${{ matrix.target }}/release/${bin}" stage/
+          done
+          cp LICENSE README.md stage/
+          tar -C stage -czf "dist/t3fleet-${{ matrix.target }}.tar.gz" .
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist, stage -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/t3fleet.exe" stage/
+          Copy-Item LICENSE, README.md stage/
+          Compress-Archive -Path stage/* -DestinationPath "dist/t3fleet-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd artifacts
+          sha256sum t3fleet-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release create "$TAG" artifacts/* \
+            --title "$TAG" \
+            --generate-notes

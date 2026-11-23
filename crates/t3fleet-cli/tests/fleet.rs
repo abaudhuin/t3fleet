@@ -3,11 +3,13 @@ use std::{
     fs,
     io::Read,
     net::{Ipv4Addr, SocketAddr},
-    os::unix::fs::PermissionsExt,
     process::{Output, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use axum::{
     Json, Router,
@@ -19,7 +21,8 @@ use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use t3fleet_protocol::{
-    EnrollResponse, InviteResponse, PairResponse, SshTicketResponse, StatusResponse, WakePolicy,
+    AdminUsageEntry, EnrollResponse, InviteResponse, PairResponse, SshTicketResponse,
+    StatusResponse, WakePolicy,
 };
 use t3fleet_server::{App, Settings};
 use tempfile::TempDir;
@@ -50,6 +53,7 @@ struct Machine {
     activity: Activity,
     archive_after: Option<String>,
     stopped_at: Option<String>,
+    resume_expired: bool,
 }
 
 struct Call {
@@ -63,6 +67,8 @@ struct Call {
 #[derive(Default)]
 struct BoatMock {
     machines: HashMap<String, Machine>,
+    creates: HashMap<String, String>,
+    snapshots: HashMap<String, (String, usize)>,
     calls: Vec<Call>,
     endpoint: Option<SocketAddr>,
     transient_keys: usize,
@@ -106,12 +112,28 @@ async fn mock_boat(
     let (status, payload) = match (method, segments.as_slice()) {
         (Method::POST, ["sandboxes"]) => {
             let username = body["labels"]["t3fleet.user"].as_str().unwrap();
-            let id = format!("bx_{username}");
+            let name = body["labels"]["t3fleet.sandbox"].as_str().unwrap();
+            let mut id = format!("bx_{username}");
+            let mut alias = format!("t3fleet-{username}");
+            if name != "default" {
+                id.push_str(&format!("_{name}"));
+                alias.push_str(&format!("-{name}"));
+            }
+            if let Some(snapshot) = body["from"]
+                .as_str()
+                .filter(|name| name.starts_with("t3fleet-keep-"))
+            {
+                assert!(boat.snapshots.contains_key(snapshot));
+                id.push_str("_restored");
+            }
             assert_eq!(body["noEnv"], true);
+            assert_eq!(body["visibility"], "private");
             assert_eq!(body["ttlSeconds"], 7200);
-            assert_eq!(body["name"], format!("t3fleet-{username}"));
+            assert_eq!(body["name"], alias);
             assert_eq!(body["labels"]["t3fleet.managed"], "true");
-            assert_eq!(get_header("idempotency-key").unwrap().len(), 36);
+            let key = get_header("idempotency-key").unwrap();
+            assert_eq!(key.len(), 36);
+            let id = boat.creates.entry(key.into()).or_insert(id).clone();
             boat.machines.entry(id.clone()).or_insert_with(|| Machine {
                 state: "ready",
                 ..Machine::default()
@@ -126,7 +148,9 @@ async fn mock_boat(
             }
         }
         (Method::GET, ["sandboxes", id]) => {
-            let machine = &boat.machines[*id];
+            let Some(machine) = boat.machines.get(*id) else {
+                return (StatusCode::NOT_FOUND, Json(json!({"ok": false})));
+            };
             (
                 StatusCode::OK,
                 json!({
@@ -150,16 +174,71 @@ async fn mock_boat(
         }
         (Method::POST, ["sandboxes", id, "resume"]) => {
             assert_eq!(body, json!({"ttlSeconds": 7200}));
-            let machine = boat.machines.get_mut(*id).unwrap();
+            let Some(machine) = boat.machines.get_mut(*id) else {
+                return (StatusCode::NOT_FOUND, Json(json!({"ok": false})));
+            };
             assert_eq!(machine.state, "archived");
+            if machine.resume_expired {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"ok": false, "error": {"code": "snapshot_data_expired"}})),
+                );
+            }
             machine.state = "running";
             machine.stopped_at = None;
             (StatusCode::ACCEPTED, json!({"ok": true}))
         }
         (Method::DELETE, ["sandboxes", id]) => {
             assert_eq!(get_header("x-ascii-confirm-delete"), Some(*id));
-            assert!(boat.machines.remove(*id).is_some());
+            if boat.machines.remove(*id).is_some() {
+                (StatusCode::ACCEPTED, json!({"ok": true}))
+            } else {
+                (StatusCode::NOT_FOUND, json!({"ok": false}))
+            }
+        }
+        (Method::GET, ["sandboxes", id, "usage"]) => {
+            let Some(machine) = boat.machines.get(*id) else {
+                return (StatusCode::NOT_FOUND, Json(json!({"ok": false})));
+            };
+            (
+                StatusCode::OK,
+                json!({
+                    "ok": true, "sandboxId": id, "sandboxType": "small",
+                    "seconds": 5400, "dollars": 0.054, "running": machine.state != "archived",
+                }),
+            )
+        }
+        (Method::POST, ["saved-snapshots"]) => {
+            let id = body["sandboxId"].as_str().unwrap();
+            let name = body["name"].as_str().unwrap();
+            assert_eq!(name, format!("t3fleet-keep-{}", id.replace('_', "-")));
+            assert_eq!(boat.machines[id].state, "archived");
+            assert!(boat.snapshots.insert(name.into(), (id.into(), 1)).is_none());
             (StatusCode::ACCEPTED, json!({"ok": true}))
+        }
+        (Method::GET, ["saved-snapshots", name]) => {
+            let Some((id, pending_reads)) = boat.snapshots.get_mut(*name) else {
+                return (StatusCode::NOT_FOUND, Json(json!({"ok": false})));
+            };
+            let state = if *pending_reads > 0 {
+                *pending_reads -= 1;
+                "saving"
+            } else {
+                "ready"
+            };
+            (
+                StatusCode::OK,
+                json!({
+                    "ok": true, "snapshot": {"name": name, "status": state, "sourceSandboxId": id },
+                }),
+            )
+        }
+        (Method::DELETE, ["saved-snapshots", name]) => {
+            if boat.snapshots.remove(*name).is_some() {
+                (StatusCode::OK, json!({"ok": true}))
+            } else {
+                (StatusCode::NOT_FOUND, json!({"ok": false}))
+            }
         }
         (Method::POST, ["sandboxes", id, "sshkey"]) => {
             assert_ne!(boat.machines[*id].state, "archived");
@@ -277,6 +356,9 @@ fn settings_with_policy(
         cooldown: Duration::from_secs(120),
         wake_policy,
         skip_bootstrap: !bootstrap,
+        max_sandboxes_per_user: 5,
+        default_template: None,
+        snapshot_retention_days: 13,
     }
 }
 
@@ -290,17 +372,17 @@ impl Fleet {
     }
 
     async fn start_with_policy(bootstrap: bool, wake_policy: WakePolicy) -> Self {
+        Self::start_configured(bootstrap, |settings| settings.wake_policy = wake_policy).await
+    }
+
+    async fn start_configured(bootstrap: bool, configure: impl FnOnce(&mut Settings)) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let boat = Arc::new(Mutex::new(BoatMock::default()));
         let (boat_url, boat_task) =
             serve(Router::new().fallback(mock_boat).with_state(boat.clone())).await;
-        let (app, generated) = App::open(settings_with_policy(
-            &temp,
-            &boat_url,
-            bootstrap,
-            wake_policy,
-        ))
-        .unwrap();
+        let mut settings = settings(&temp, &boat_url, bootstrap);
+        configure(&mut settings);
+        let (app, generated) = App::open(settings).unwrap();
         assert!(generated.is_none());
         let (server_url, server_task) = serve(app.router()).await;
         let http = Client::builder()
@@ -352,6 +434,7 @@ impl Fleet {
     fn cli(&self) -> Command {
         let mut cli = Command::new(env!("CARGO_BIN_EXE_t3fleet"));
         cli.env("HOME", self.temp.path())
+            .env("USERPROFILE", self.temp.path())
             .env("XDG_CONFIG_HOME", self.temp.path())
             .env("NO_PROXY", "127.0.0.1")
             .env_remove("T3FLEET_CONFIG")
@@ -746,6 +829,7 @@ async fn cli_join_installs_ssh_config_and_proxy_pins_key_and_relays_bytes() {
     let identity = fs::read(dir.join("id_ed25519")).unwrap();
     success(join(cli_invite("invite").await).output().await.unwrap());
     assert_eq!(identity, fs::read(dir.join("id_ed25519")).unwrap());
+    #[cfg(unix)]
     for path in [&config, &dir.join("id_ed25519")] {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -761,7 +845,7 @@ async fn cli_join_installs_ssh_config_and_proxy_pins_key_and_relays_bytes() {
     assert_eq!(included.matches("Include ").count(), 1);
     assert!(included.ends_with(old_config));
     let ssh_options = success(
-        Command::new("ssh")
+        Command::new(if cfg!(windows) { "ssh.exe" } else { "ssh" })
             .args(["-G", "-F"])
             .arg(&ssh_config)
             .arg("t3fleet-alice")
@@ -845,6 +929,7 @@ async fn cli_join_installs_ssh_config_and_proxy_pins_key_and_relays_bytes() {
         fs::read_to_string(&known_hosts).unwrap(),
         format!("t3fleet-alice {expected_key}\nunrelated ssh-ed25519 key\n")
     );
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(known_hosts).unwrap().permissions().mode() & 0o777,
         0o600
@@ -932,4 +1017,380 @@ async fn aggressive_idle_stops_idle_tunnel_and_prevents_reconnect_wake_loop() {
         .json(&json!({"ssh_public_key": KEY, "intent": "explicit"})))
     .await;
     assert_eq!(explicit.sandbox_id, idle_tunnel.sandbox_id);
+}
+
+#[tokio::test]
+async fn cli_manages_named_sandboxes_and_syncs_ssh_fragments() {
+    let fleet =
+        Fleet::start_configured(false, |settings| settings.max_sandboxes_per_user = 2).await;
+    let dir = fleet.temp.path().join("named-device");
+    let config = dir.join("config.toml");
+    let ssh_config = fleet.temp.path().join("named-ssh-config");
+    let invite = fleet.invite("alice", true).await;
+
+    let join = |token: &str, dir: &std::path::Path, ssh_config: &std::path::Path| {
+        let mut command = fleet.cli();
+        command
+            .args(["join", "--server", &fleet.server_url, "--token", token])
+            .arg("--config-dir")
+            .arg(dir)
+            .arg("--ssh-config")
+            .arg(ssh_config);
+        command
+    };
+    let cli = |args: &[&str]| {
+        let mut command = fleet.cli();
+        command.arg("--config").arg(&config).args(args);
+        command
+    };
+    success(
+        join(&invite.enrollment_token, &dir, &ssh_config)
+            .output()
+            .await
+            .unwrap(),
+    );
+    let created = success(
+        cli(&[
+            "sandbox",
+            "new",
+            "build",
+            "--size",
+            "large",
+            "--template",
+            "team-build",
+        ])
+        .output()
+        .await
+        .unwrap(),
+    );
+    assert!(created.contains("t3fleet-alice-build"));
+    let named_fragment = dir.join("ssh/t3fleet-alice-build.conf");
+    assert!(named_fragment.exists());
+    fs::remove_file(&named_fragment).unwrap();
+    let stale = dir.join("ssh/t3fleet-alice-stale.conf");
+    let unrelated = dir.join("ssh/custom.conf");
+    fs::write(&stale, "stale").unwrap();
+    fs::write(&unrelated, "custom").unwrap();
+    success(cli(&["sync"]).output().await.unwrap());
+    assert!(named_fragment.exists() && unrelated.exists() && !stale.exists());
+
+    let second_invite: InviteResponse = ok(fleet
+        .admin(Method::POST, "/v1/admin/users/alice/invite")
+        .json(&json!({})))
+    .await;
+    let second_dir = fleet.temp.path().join("second-named-device");
+    success(
+        join(
+            &second_invite.enrollment_token,
+            &second_dir,
+            &fleet.temp.path().join("second-ssh-config"),
+        )
+        .output()
+        .await
+        .unwrap(),
+    );
+    assert!(second_dir.join("ssh/t3fleet-alice-build.conf").exists());
+    let listed: Vec<StatusResponse> = serde_json::from_str(&success(
+        cli(&["sandbox", "list", "--json"]).output().await.unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].sandbox_name.as_deref(), Some("build"));
+    assert_eq!(listed[0].sandbox_size, "large");
+    assert_eq!(listed[0].template.as_deref(), Some("team-build"));
+    assert_eq!(listed[1].sandbox_name.as_deref(), Some("default"));
+    success(cli(&["stop", "--sandbox", "build"]).output().await.unwrap());
+    success(cli(&["wake", "--sandbox", "build"]).output().await.unwrap());
+    let links = success(
+        cli(&["connect", "--sandbox", "build", "--no-tunnel"])
+            .output()
+            .await
+            .unwrap(),
+    );
+    assert!(links.contains("t3code://pair"));
+
+    for (args, message) in [
+        (["sandbox", "new", "other"], "Sandbox limit reached"),
+        (
+            ["sandbox", "rm", "default"],
+            "The default sandbox cannot be deleted",
+        ),
+    ] {
+        let result = cli(&args).output().await.unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains(message));
+    }
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    fleet.boat.lock().unwrap().endpoint = Some(listener.local_addr().unwrap());
+    let socket = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"named proxy\n").await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    let banner = timeout(
+        Duration::from_secs(10),
+        cli(&["ssh-proxy", "--alias", "t3fleet-alice-build"])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(success(banner), "named proxy\n");
+    socket.await.unwrap();
+    let named_hosts = dir.join("ssh/t3fleet-alice-build.known_hosts");
+    assert!(
+        fs::read_to_string(&named_hosts)
+            .unwrap()
+            .starts_with("t3fleet-alice-build ssh-ed25519 ")
+    );
+    success(cli(&["sandbox", "rm", "build"]).output().await.unwrap());
+    assert!(!named_fragment.exists() && !named_hosts.exists());
+
+    let boat = fleet.boat.lock().unwrap();
+    assert_eq!(
+        boat.count(Method::POST, "/sandboxes/bx_alice_build/sshkey"),
+        1
+    );
+    assert_eq!(boat.count(Method::DELETE, "/sandboxes/bx_alice_build"), 1);
+    let create = boat
+        .calls
+        .iter()
+        .find(|call| call.body["name"] == "t3fleet-alice-build")
+        .unwrap();
+    assert_eq!(create.body["from"], "team-build");
+}
+
+#[tokio::test]
+async fn single_sandbox_mode_and_reserved_snapshot_names() {
+    let fleet =
+        Fleet::start_configured(false, |settings| settings.max_sandboxes_per_user = 1).await;
+    let alice = fleet.employee("alice", false).await;
+    let create = |body| {
+        fleet
+            .me(&alice, Method::POST, "/v1/me/sandboxes")
+            .json(&body)
+    };
+    for name in ["default", "Uppercase", "-start"] {
+        rejected(create(json!({"name": name})), StatusCode::BAD_REQUEST).await;
+    }
+    rejected(
+        create(json!({"name": "clone", "template": "t3fleet-keep-bx-alice"})),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    rejected(create(json!({"name": "build"})), StatusCode::CONFLICT).await;
+    rejected(
+        fleet.me(&alice, Method::POST, "/v1/me/wake?sandbox=build"),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(
+        fleet.boat.lock().unwrap().count(Method::POST, "/sandboxes"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn templates_and_usage_are_available_from_the_cli() {
+    let fleet = Fleet::start_configured(true, |settings| {
+        settings.default_template = Some("team-base".into())
+    })
+    .await;
+    let alice = fleet.invite("alice", true).await;
+    let admin = |args: &[&str]| {
+        let mut command = fleet.cli();
+        command
+            .args([
+                "admin",
+                "--server",
+                &fleet.server_url,
+                "--admin-token",
+                ADMIN,
+            ])
+            .args(args);
+        command
+    };
+    let invite: InviteResponse = serde_json::from_str(&success(
+        admin(&[
+            "user",
+            "create",
+            "bob",
+            "--no-provision",
+            "--template",
+            "bob-base",
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap(),
+    ))
+    .unwrap();
+    assert!(invite.sandbox_id.is_none());
+    let _: EnrollResponse = ok(fleet.enroll(&invite.enrollment_token, "bob-device")).await;
+
+    let config_dir = fleet.temp.path().join("usage-device");
+    success(
+        fleet
+            .cli()
+            .args([
+                "join",
+                "--server",
+                &fleet.server_url,
+                "--token",
+                &alice.enrollment_token,
+            ])
+            .arg("--config-dir")
+            .arg(&config_dir)
+            .arg("--ssh-config")
+            .arg(fleet.temp.path().join("usage-ssh-config"))
+            .output()
+            .await
+            .unwrap(),
+    );
+
+    let usage = success(
+        fleet
+            .cli()
+            .arg("--config")
+            .arg(config_dir.join("config.toml"))
+            .args(["status", "--usage"])
+            .output()
+            .await
+            .unwrap(),
+    );
+    assert!(usage.contains("1.50 billable hours  $0.0540"));
+    let entries: Vec<AdminUsageEntry> = serde_json::from_str(&success(
+        admin(&["usage", "--json"]).output().await.unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].username, "alice");
+    assert_eq!(entries[0].sandbox_name, "default");
+    assert_eq!(entries[0].usage.seconds, 5400);
+    assert_eq!(entries[1].usage.sandbox_id, "bx_bob");
+
+    let boat = fleet.boat.lock().unwrap();
+    let templates: Vec<_> = boat
+        .calls
+        .iter()
+        .filter(|call| call.path == "/sandboxes")
+        .map(|call| call.body["from"].as_str().unwrap())
+        .collect();
+    assert_eq!(templates, ["team-base", "bob-base"]);
+    let bootstrap = boat
+        .calls
+        .iter()
+        .find(|call| call.path == "/sandboxes/bx_alice/commands")
+        .unwrap();
+    assert!(
+        bootstrap.body["command"]
+            .as_str()
+            .unwrap()
+            .starts_with(concat!(
+                "set -eu\n",
+                "if [ -x /home/user/.local/bin/t3 ] && systemctl is-active --quiet t3code; then\n",
+                "    exit 0\nfi\n",
+            ))
+    );
+}
+
+#[tokio::test]
+async fn watchdog_preserves_archives_and_restores_or_cleans_up_saved_snapshots() {
+    let fleet = Fleet::start(false).await;
+    let alice = fleet.employee("alice", true).await;
+    let create = |name| {
+        fleet
+            .me(&alice, Method::POST, "/v1/me/sandboxes")
+            .json(&json!({"name": name}))
+    };
+    let _: StatusResponse = ok(create("build")).await;
+    let _: StatusResponse = ok(create("short")).await;
+    let _: StatusResponse = ok(create("remove")).await;
+    let _: StatusResponse = ok(create("gone")).await;
+    let age = |id: &str, days, expired| {
+        let mut boat = fleet.boat.lock().unwrap();
+        let machine = boat.machines.get_mut(id).unwrap();
+        machine.state = "archived";
+        machine.stopped_at = Some((Utc::now() - TimeDelta::days(days)).to_rfc3339());
+        machine.resume_expired = expired;
+    };
+    age("bx_alice", 13, false);
+    age("bx_alice_build", 14, true);
+    age("bx_alice_short", 12, false);
+    age("bx_alice_remove", 14, false);
+    age("bx_alice_gone", 14, true);
+    fleet.app.watch_once().await.unwrap();
+    {
+        let boat = fleet.boat.lock().unwrap();
+        assert_eq!(boat.count(Method::POST, "/saved-snapshots"), 4);
+        assert!(!boat.snapshots.contains_key("t3fleet-keep-bx-alice-short"));
+    }
+
+    let status: StatusResponse =
+        ok(fleet.me(&alice, Method::GET, "/v1/me/status?sandbox=build")).await;
+    assert_eq!(
+        status.preserved_snapshot.as_deref(),
+        Some("t3fleet-keep-bx-alice-build")
+    );
+    let wake = || fleet.me(&alice, Method::POST, "/v1/me/wake?sandbox=build");
+    fleet.boat.lock().unwrap().fail_create_response = true;
+    rejected(wake(), StatusCode::BAD_GATEWAY).await;
+    let restored: StatusResponse = ok(wake()).await;
+    assert_eq!(
+        restored.sandbox_id.as_deref(),
+        Some("bx_alice_build_restored")
+    );
+    assert_eq!(restored.preserved_snapshot, None);
+    let status: StatusResponse =
+        ok(fleet.me(&alice, Method::GET, "/v1/me/status?sandbox=build")).await;
+    assert_eq!(status.sandbox_id, restored.sandbox_id);
+
+    let _: StatusResponse = ok(fleet.admin(
+        Method::POST,
+        "/v1/admin/sandboxes/alice/wake?sandbox=default",
+    ))
+    .await;
+    let _: Value = ok(fleet.me(&alice, Method::DELETE, "/v1/me/sandboxes/remove")).await;
+    fleet.boat.lock().unwrap().machines.remove("bx_alice_gone");
+    let gone: StatusResponse = ok(fleet.me(&alice, Method::POST, "/v1/me/wake?sandbox=gone")).await;
+    assert_eq!(gone.sandbox_id.as_deref(), Some("bx_alice_gone_restored"));
+    age("bx_alice_short", 14, false);
+    fleet.app.watch_once().await.unwrap();
+    let _: Value =
+        ok(fleet.admin(Method::DELETE, "/v1/admin/users/alice?delete_sandbox=true")).await;
+
+    let boat = fleet.boat.lock().unwrap();
+    assert!(boat.snapshots.is_empty() && boat.machines.is_empty());
+    for name in ["build", "remove", "short", "gone"] {
+        assert_eq!(
+            boat.count(
+                Method::DELETE,
+                &format!("/saved-snapshots/t3fleet-keep-bx-alice-{name}")
+            ),
+            1
+        );
+    }
+    assert_eq!(
+        boat.count(Method::DELETE, "/saved-snapshots/t3fleet-keep-bx-alice"),
+        1
+    );
+    let restores: Vec<_> = boat
+        .calls
+        .iter()
+        .filter(|call| call.body["from"] == "t3fleet-keep-bx-alice-build")
+        .collect();
+    assert_eq!(restores.len(), 2);
+    assert_eq!(restores[0].idempotency, restores[1].idempotency);
+    let original = boat
+        .calls
+        .iter()
+        .find(|call| {
+            call.path == "/sandboxes"
+                && call.body["name"] == "t3fleet-alice-build"
+                && call.body["from"].is_null()
+        })
+        .unwrap();
+    assert_ne!(restores[0].idempotency, original.idempotency);
 }

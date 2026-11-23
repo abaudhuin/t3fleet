@@ -1,0 +1,22 @@
+[Unit]
+Description=t3fleet control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=t3fleet
+Group=t3fleet
+StateDirectory=t3fleet
+WorkingDirectory=/var/lib/t3fleet
+EnvironmentFile=/etc/t3fleet/server.env
+ExecStart=/usr/local/bin/t3fleet-server --db /var/lib/t3fleet/t3fleet.db
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/t3fleet
+
+[Install]
+WantedBy=multi-user.target

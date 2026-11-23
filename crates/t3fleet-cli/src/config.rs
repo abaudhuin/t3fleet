@@ -1,15 +1,25 @@
 use std::{
     fs::{self, DirBuilder},
     io::{self, Write},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
+use t3fleet_protocol::{DEFAULT_SANDBOX_NAME, valid_sandbox_name};
+use tempfile::{NamedTempFile, TempPath};
 use tokio::process::Command;
+
+pub const SSH_PROGRAM: &str = if cfg!(windows) { "ssh.exe" } else { "ssh" };
+const SSH_KEYGEN: &str = if cfg!(windows) {
+    "ssh-keygen.exe"
+} else {
+    "ssh-keygen"
+};
 
 #[derive(Deserialize, Serialize)]
 pub struct Config {
@@ -35,6 +45,46 @@ impl Config {
         atomic_write(path, toml::to_string_pretty(self)?.as_bytes())
     }
 
+    pub fn alias(&self, sandbox: Option<&str>) -> Result<String> {
+        let name = sandbox.unwrap_or(DEFAULT_SANDBOX_NAME);
+        ensure!(valid_sandbox_name(name), "invalid sandbox name");
+        validate_alias(&self.ssh_alias)?;
+        Ok(if name == DEFAULT_SANDBOX_NAME {
+            self.ssh_alias.clone()
+        } else {
+            format!("{}-{name}", self.ssh_alias)
+        })
+    }
+
+    pub fn sandbox_name<'a>(&self, alias: &'a str) -> Result<Option<&'a str>> {
+        validate_alias(alias)?;
+        validate_alias(&self.ssh_alias)?;
+        if alias == self.ssh_alias {
+            return Ok(None);
+        }
+        let name = alias
+            .strip_prefix(&self.ssh_alias)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .filter(|name| *name != DEFAULT_SANDBOX_NAME && valid_sandbox_name(name))
+            .context("SSH alias does not match fleet configuration")?;
+        Ok(Some(name))
+    }
+
+    fn fragment_dir(&self) -> Result<PathBuf> {
+        Ok(self
+            .identity_file
+            .parent()
+            .context("identity path has no parent")?
+            .join("ssh"))
+    }
+
+    pub fn known_hosts_for(&self, alias: &str) -> Result<PathBuf> {
+        if self.sandbox_name(alias)?.is_none() {
+            return Ok(self.known_hosts.clone());
+        }
+        Ok(self.fragment_dir()?.join(format!("{alias}.known_hosts")))
+    }
+
     pub fn public_key(&self) -> Result<String> {
         public_key(&self.identity_file)
     }
@@ -57,9 +107,11 @@ pub fn absolute(path: PathBuf) -> Result<PathBuf> {
 }
 
 pub fn create_dir(path: &Path) -> Result<()> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder
         .create(path)
         .with_context(|| format!("creating {}", path.display()))
 }
@@ -67,6 +119,7 @@ pub fn create_dir(path: &Path) -> Result<()> {
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path.parent().context("file path has no parent")?;
     let mut temp = NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     temp.write_all(contents)?;
@@ -88,7 +141,7 @@ pub async fn ensure_key(path: &Path) -> Result<String> {
     if !path.try_exists()? {
         let temp = tempfile::tempdir_in(path.parent().context("identity path has no parent")?)?;
         let generated = temp.path().join("id_ed25519");
-        let status = Command::new("ssh-keygen")
+        let status = Command::new(SSH_KEYGEN)
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "t3fleet", "-f"])
             .arg(&generated)
             .stdin(Stdio::null())
@@ -96,15 +149,18 @@ pub async fn ensure_key(path: &Path) -> Result<String> {
             .await
             .context("running ssh-keygen")?;
         ensure!(status.success(), "ssh-keygen failed");
-        match fs::hard_link(&generated, path) {
-            Ok(()) => atomic_write(&public, &fs::read(generated.with_extension("pub"))?)?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+        let generated_public = generated.with_extension("pub");
+        // Move the key without overwriting a key from a concurrent join or changing its ACL.
+        match TempPath::try_from_path(generated)?.persist_noclobber(path) {
+            Ok(()) => atomic_write(&public, &fs::read(generated_public)?)?,
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.error.into()),
         }
     }
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     if !public.try_exists()? {
-        let output = Command::new("ssh-keygen")
+        let output = Command::new(SSH_KEYGEN)
             .args(["-y", "-f"])
             .arg(path)
             .stdin(Stdio::null())
@@ -136,8 +192,21 @@ fn ssh_quote(text: &str) -> String {
 }
 
 fn proxy_path(path: &Path) -> Result<String> {
-    let text = path_text(path)?.replace('%', "%%").replace('\'', "'\"'\"'");
-    Ok(format!("'{text}'"))
+    let text = path_text(path)?.replace('%', "%%");
+    #[cfg(windows)]
+    let quoted = format!("\"{}\"", text.replace('"', "\\\""));
+    #[cfg(not(windows))]
+    let quoted = format!("'{}'", text.replace('\'', "'\"'\"'"));
+    Ok(quoted)
+}
+
+fn ssh_path(path: &Path) -> Result<String> {
+    let text = path_text(path)?;
+    #[cfg(windows)]
+    let normalized = text.replace('\\', "/");
+    #[cfg(windows)]
+    let text = normalized.as_str();
+    Ok(ssh_quote(text))
 }
 
 pub fn validate_alias(alias: &str) -> Result<()> {
@@ -152,16 +221,13 @@ pub fn validate_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn write_ssh(config: &Config, config_path: &Path, dir: &Path) -> Result<()> {
-    let alias = &config.ssh_alias;
-    validate_alias(alias)?;
+pub fn write_ssh(config: &Config, config_path: &Path, alias: &str) -> Result<()> {
     let binary = proxy_path(&std::env::current_exe()?)?;
     let config_arg = proxy_path(config_path)?;
-    let identity = ssh_quote(path_text(&config.identity_file)?);
-    let known = ssh_quote(path_text(&config.known_hosts)?);
-    let fragment_dir = dir.join("ssh");
+    let identity = ssh_path(&config.identity_file)?;
+    let known = ssh_path(&config.known_hosts_for(alias)?)?;
+    let fragment_dir = config.fragment_dir()?;
     let fragment_path = fragment_dir.join(format!("{alias}.conf"));
-    let ssh_config = &config.ssh_config;
     create_dir(&fragment_dir)?;
     let fragment = format!(
         "Host {alias}\n  User user\n  IdentityFile {identity}\n  IdentitiesOnly yes\n  \
@@ -169,15 +235,23 @@ pub fn write_ssh(config: &Config, config_path: &Path, dir: &Path) -> Result<()> 
          ServerAliveInterval 30\n  ServerAliveCountMax 3\n  \
          ProxyCommand {binary} ssh-proxy --config {config_arg} --alias {alias}\n"
     );
-    atomic_write(&fragment_path, fragment.as_bytes())?;
+    atomic_write(&fragment_path, fragment.as_bytes())
+}
 
+pub fn include_ssh(config: &Config) -> Result<()> {
+    let ssh_config = &config.ssh_config;
+    let fragment_dir = config.fragment_dir()?;
+    create_dir(&fragment_dir)?;
     create_dir(
         ssh_config
             .parent()
             .context("SSH configuration has no parent")?,
     )?;
     let mut pattern = String::new();
-    for ch in path_text(&fragment_dir)?.chars() {
+    let dir = path_text(&fragment_dir)?;
+    #[cfg(windows)]
+    let dir = dir.replace('\\', "/");
+    for ch in dir.chars() {
         if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
             pattern.push('\\');
         }
@@ -193,6 +267,45 @@ pub fn write_ssh(config: &Config, config_path: &Path, dir: &Path) -> Result<()> 
     }
     if updated != current {
         atomic_write(ssh_config, updated.as_bytes())?;
+    }
+    Ok(())
+}
+
+pub fn remove_ssh(config: &Config, alias: &str) -> Result<()> {
+    ensure!(
+        config.sandbox_name(alias)?.is_some(),
+        "cannot remove the default SSH alias"
+    );
+    for path in [
+        config.fragment_dir()?.join(format!("{alias}.conf")),
+        config.known_hosts_for(alias)?,
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn prune_ssh(config: &Config, aliases: &[String]) -> Result<()> {
+    for entry in fs::read_dir(config.fragment_dir()?)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let Some(alias) = filename
+            .to_str()
+            .and_then(|name| name.strip_suffix(".conf"))
+        else {
+            continue;
+        };
+        if !aliases.iter().any(|current| current == alias)
+            && matches!(config.sandbox_name(alias), Ok(Some(_)))
+        {
+            remove_ssh(config, alias)?;
+        }
     }
     Ok(())
 }

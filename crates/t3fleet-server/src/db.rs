@@ -2,10 +2,8 @@ use std::{path::Path, sync::Mutex};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use t3fleet_protocol::{SandboxActivity, StatusResponse, WakePolicy};
+use t3fleet_protocol::{DEFAULT_SANDBOX_NAME, SandboxActivity, StatusResponse, WakePolicy};
 use uuid::Uuid;
-
-pub const DEFAULT_SANDBOX_NAME: &str = "default";
 
 pub struct Db(Mutex<Connection>);
 
@@ -13,9 +11,15 @@ pub struct User {
     pub id: String,
     pub username: String,
     pub size: String,
+    pub template: Option<String>,
 }
 
 pub struct Sandbox {
+    pub id: String,
+    pub size: String,
+    pub template: Option<String>,
+    pub preserved_snapshot: Option<String>,
+    pub restore_key: Option<String>,
     pub name: String,
     pub boat_id: String,
     pub alias: String,
@@ -50,12 +54,46 @@ fn user_row(row: &Row<'_>) -> rusqlite::Result<User> {
         id: row.get(0)?,
         username: row.get(1)?,
         size: row.get(2)?,
+        template: row.get(3)?,
     })
+}
+
+const SANDBOX_COLUMNS: &str = "s.id, s.size, s.template, s.preserved_snapshot, s.restore_key,
+    s.name, s.boat_sandbox_id, s.ssh_alias, s.state, s.bootstrapped_at, s.last_activity_at,
+    s.stopped_at, s.stopped_reason, s.last_activity_json";
+
+fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Sandbox> {
+    let activity_json: Option<String> = row.get(13)?;
+    Ok(Sandbox {
+        id: row.get(0)?,
+        size: row.get(1)?,
+        template: row.get(2)?,
+        preserved_snapshot: row.get(3)?,
+        restore_key: row.get(4)?,
+        name: row.get(5)?,
+        boat_id: row.get(6)?,
+        alias: row.get(7)?,
+        state: row.get(8)?,
+        bootstrapped_at: time_column(row, 9)?,
+        last_activity_at: time_column(row, 10)?,
+        stopped_at: time_column(row, 11)?,
+        stopped_reason: row.get(12)?,
+        last_activity: activity_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
+    })
+}
+
+impl Sandbox {
+    // The reservation keeps an idempotency key even if Boat's create response is lost.
+    pub fn provisioned(&self) -> bool {
+        !self.boat_id.starts_with("pending:")
+    }
 }
 
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
@@ -90,6 +128,25 @@ impl Db {
                 created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT
              );",
         )?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (table, column) in [
+            ("users", "template"),
+            ("sandboxes", "template"),
+            ("sandboxes", "preserved_snapshot"),
+            ("sandboxes", "restore_key"),
+        ] {
+            let present: bool = tx.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"
+                ),
+                [column],
+                |row| row.get(0),
+            )?;
+            if !present {
+                tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+            }
+        }
+        tx.commit()?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -107,15 +164,21 @@ impl Db {
         Ok((hash, inserted))
     }
 
-    pub fn create_user(&self, username: String, size: String) -> rusqlite::Result<User> {
+    pub fn create_user(
+        &self,
+        username: String,
+        size: String,
+        template: Option<String>,
+    ) -> rusqlite::Result<User> {
         let user = User {
             id: Uuid::new_v4().to_string(),
             username,
             size,
+            template,
         };
         self.0.lock().unwrap().execute(
-            "INSERT INTO users(id, username, sandbox_size, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![user.id, user.username, user.size, timestamp(Utc::now())],
+            "INSERT INTO users(id, username, sandbox_size, created_at, template) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user.id, user.username, user.size, timestamp(Utc::now()), user.template],
         )?;
         Ok(user)
     }
@@ -125,23 +188,20 @@ impl Db {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, username, sandbox_size FROM users WHERE username = ?1",
+                "SELECT id, username, sandbox_size, template FROM users WHERE username = ?1",
                 [username],
                 user_row,
             )
             .optional()
     }
 
-    pub fn users(&self, watched: bool) -> rusqlite::Result<Vec<User>> {
-        let conn = self.0.lock().unwrap();
-        let mut statement = conn.prepare(if watched {
-            "SELECT u.id, u.username, u.sandbox_size FROM users u
-             JOIN sandboxes s ON s.user_id = u.id
-             WHERE s.state IN ('running', 'ready', 'idle') ORDER BY u.username"
-        } else {
-            "SELECT id, username, sandbox_size FROM users ORDER BY username"
-        })?;
-        statement.query_map([], user_row)?.collect()
+    pub fn users(&self) -> rusqlite::Result<Vec<User>> {
+        self.0
+            .lock()
+            .unwrap()
+            .prepare("SELECT id, username, sandbox_size, template FROM users ORDER BY username")?
+            .query_map([], user_row)?
+            .collect()
     }
 
     pub fn invite(&self, user: &User, hash: &str, expires: DateTime<Utc>) -> rusqlite::Result<()> {
@@ -164,7 +224,7 @@ impl Db {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT u.id, u.username, u.sandbox_size FROM users u
+                "SELECT u.id, u.username, u.sandbox_size, u.template FROM users u
              JOIN enrollment_tokens e ON e.user_id = u.id
              WHERE e.token_hash = ?1 AND e.used_at IS NULL AND e.expires_at > ?2",
                 params![hash, timestamp(Utc::now())],
@@ -214,7 +274,7 @@ impl Db {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT u.id, u.username, u.sandbox_size FROM users u
+                "SELECT u.id, u.username, u.sandbox_size, u.template FROM users u
              JOIN api_tokens a ON a.user_id = u.id
              WHERE a.token_hash = ?1 AND a.revoked_at IS NULL",
                 [hash],
@@ -246,51 +306,104 @@ impl Db {
         Ok(())
     }
 
-    pub fn sandbox(&self, user: &User) -> rusqlite::Result<Option<Sandbox>> {
+    pub fn sandbox(&self, user: &User, name: &str) -> rusqlite::Result<Option<Sandbox>> {
         self.0
             .lock()
             .unwrap()
             .query_row(
-                "SELECT name, boat_sandbox_id, ssh_alias, state, bootstrapped_at, last_activity_at,
-                    stopped_at, stopped_reason, last_activity_json
-                 FROM sandboxes WHERE user_id = ?1 AND name = ?2",
-                params![&user.id, DEFAULT_SANDBOX_NAME],
-                |row| {
-                    let activity_json: Option<String> = row.get(8)?;
-                    let last_activity = activity_json
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str(raw).ok());
-                    Ok(Sandbox {
-                        name: row.get(0)?,
-                        boat_id: row.get(1)?,
-                        alias: row.get(2)?,
-                        state: row.get(3)?,
-                        bootstrapped_at: time_column(row, 4)?,
-                        last_activity_at: time_column(row, 5)?,
-                        stopped_at: time_column(row, 6)?,
-                        stopped_reason: row.get(7)?,
-                        last_activity,
-                    })
-                },
+                &format!(
+                    "SELECT {SANDBOX_COLUMNS} FROM sandboxes s WHERE s.user_id = ?1 AND s.name = ?2"
+                ),
+                params![user.id, name],
+                sandbox_row,
             )
             .optional()
     }
 
-    pub fn add_sandbox(&self, user: &User, boat_id: &str, state: &str) -> rusqlite::Result<()> {
-        self.0.lock().unwrap().execute(
+    pub fn sandbox_by_id(&self, id: &str) -> rusqlite::Result<Option<Sandbox>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes s WHERE s.id = ?1"),
+                [id],
+                sandbox_row,
+            )
+            .optional()
+    }
+
+    pub fn sandboxes(&self, user: &User) -> rusqlite::Result<Vec<Sandbox>> {
+        self.0
+            .lock()
+            .unwrap()
+            .prepare(&format!(
+                "SELECT {SANDBOX_COLUMNS} FROM sandboxes s WHERE s.user_id = ?1 ORDER BY s.name"
+            ))?
+            .query_map([&user.id], sandbox_row)?
+            .collect()
+    }
+
+    pub fn all_sandboxes(&self) -> rusqlite::Result<Vec<(String, Sandbox)>> {
+        self.fleet_sandboxes("")
+    }
+
+    pub fn watched_sandboxes(&self) -> rusqlite::Result<Vec<(String, Sandbox)>> {
+        self.fleet_sandboxes(
+            "WHERE s.state IN ('ready', 'idle', 'running', 'archived', 'archiving', 'stopping')",
+        )
+    }
+
+    fn fleet_sandboxes(&self, filter: &str) -> rusqlite::Result<Vec<(String, Sandbox)>> {
+        self.0
+            .lock()
+            .unwrap()
+            .prepare(&format!(
+                "SELECT {SANDBOX_COLUMNS}, u.username FROM sandboxes s
+                JOIN users u ON u.id = s.user_id {filter} ORDER BY u.username, s.name"
+            ))?
+            .query_map([], |row| Ok((row.get(14)?, sandbox_row(row)?)))?
+            .collect()
+    }
+
+    pub fn reserve_sandbox(
+        &self,
+        user: &User,
+        name: &str,
+        size: &str,
+        template: Option<&str>,
+    ) -> rusqlite::Result<Option<Sandbox>> {
+        let id = Uuid::new_v4().to_string();
+        let alias = if name == DEFAULT_SANDBOX_NAME {
+            format!("t3fleet-{}", user.username)
+        } else {
+            format!("t3fleet-{}-{name}", user.username)
+        };
+        let created = self.0.lock().unwrap().execute(
             "INSERT INTO sandboxes(id, user_id, name, boat_sandbox_id, ssh_alias, size, state,
-                                   last_activity_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8)",
+                                   last_activity_at, created_at, updated_at, template)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'provisioning', ?7, ?7, ?7, ?8)
+             ON CONFLICT(ssh_alias) DO NOTHING",
             params![
-                Uuid::new_v4().to_string(),
+                id,
                 user.id,
-                DEFAULT_SANDBOX_NAME,
-                boat_id,
-                format!("t3fleet-{}", user.username),
-                user.size,
-                state,
-                timestamp(Utc::now())
+                name,
+                format!("pending:{id}"),
+                alias,
+                size,
+                timestamp(Utc::now()),
+                template
             ],
+        )?;
+        if created == 0 {
+            return Ok(None);
+        }
+        self.sandbox(user, name)
+    }
+
+    pub fn delete_sandbox(&self, user: &User, name: &str) -> rusqlite::Result<()> {
+        self.0.lock().unwrap().execute(
+            "DELETE FROM sandboxes WHERE user_id = ?1 AND name = ?2",
+            params![user.id, name],
         )?;
         Ok(())
     }
@@ -302,8 +415,9 @@ impl Db {
             .and_then(|activity| serde_json::to_string(activity).ok());
         self.0.lock().unwrap().execute(
             "UPDATE sandboxes SET state = ?1, bootstrapped_at = ?2, last_activity_at = ?3,
-                    stopped_at = ?4, stopped_reason = ?5, last_activity_json = ?6, updated_at = ?7
-             WHERE boat_sandbox_id = ?8",
+                    stopped_at = ?4, stopped_reason = ?5, last_activity_json = ?6, updated_at = ?7,
+                    boat_sandbox_id = ?8, preserved_snapshot = ?9, restore_key = ?10
+             WHERE id = ?11",
             params![
                 sandbox.state,
                 sandbox.bootstrapped_at.map(timestamp),
@@ -312,37 +426,45 @@ impl Db {
                 sandbox.stopped_reason,
                 activity_json,
                 timestamp(Utc::now()),
-                sandbox.boat_id
+                sandbox.boat_id,
+                sandbox.preserved_snapshot,
+                sandbox.restore_key,
+                sandbox.id,
             ],
         )?;
         Ok(())
     }
+}
 
-    pub fn status(&self, user: User, wake_policy: WakePolicy) -> rusqlite::Result<StatusResponse> {
-        let sandbox = self.sandbox(&user)?;
-        let mut status = StatusResponse {
-            username: user.username,
-            sandbox_size: user.size,
-            sandbox_name: None,
-            sandbox_id: None,
-            ssh_alias: None,
-            state: None,
-            wake_policy,
-            last_activity_at: None,
-            stopped_at: None,
-            stopped_reason: None,
-            activity: None,
-        };
-        if let Some(sandbox) = sandbox {
-            status.sandbox_name = Some(sandbox.name);
-            status.sandbox_id = Some(sandbox.boat_id);
-            status.ssh_alias = Some(sandbox.alias);
-            status.state = Some(sandbox.state);
-            status.last_activity_at = sandbox.last_activity_at;
-            status.stopped_at = sandbox.stopped_at;
-            status.stopped_reason = sandbox.stopped_reason;
-            status.activity = sandbox.last_activity;
-        }
-        Ok(status)
+pub fn status(user: &User, sandbox: Option<Sandbox>, wake_policy: WakePolicy) -> StatusResponse {
+    let mut status = StatusResponse {
+        username: user.username.clone(),
+        sandbox_size: user.size.clone(),
+        sandbox_name: None,
+        sandbox_id: None,
+        ssh_alias: None,
+        state: None,
+        wake_policy,
+        last_activity_at: None,
+        stopped_at: None,
+        stopped_reason: None,
+        activity: None,
+        template: user.template.clone(),
+        preserved_snapshot: None,
+        usage: None,
+    };
+    if let Some(sandbox) = sandbox {
+        status.sandbox_id = sandbox.provisioned().then_some(sandbox.boat_id);
+        status.sandbox_name = Some(sandbox.name);
+        status.sandbox_size = sandbox.size;
+        status.ssh_alias = Some(sandbox.alias);
+        status.state = Some(sandbox.state);
+        status.last_activity_at = sandbox.last_activity_at;
+        status.stopped_at = sandbox.stopped_at;
+        status.stopped_reason = sandbox.stopped_reason;
+        status.activity = sandbox.last_activity;
+        status.template = sandbox.template;
+        status.preserved_snapshot = sandbox.preserved_snapshot;
     }
+    status
 }

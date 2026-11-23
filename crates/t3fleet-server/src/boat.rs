@@ -5,10 +5,10 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url, header};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use t3fleet_protocol::SshTicketResponse;
+use t3fleet_protocol::{SandboxUsage, SshTicketResponse};
 use tokio::time::{Instant, sleep};
 
-use crate::db::User;
+use crate::db::Sandbox;
 
 const TRANSIENT_SSH_ERRORS: &[&str] = &[
     "sandbox_restoring",
@@ -42,6 +42,54 @@ impl RemoteSandbox {
     pub fn stopping(&self) -> bool {
         matches!(self.state.as_str(), "archiving" | "stopping")
     }
+}
+
+pub enum ResumeOutcome {
+    Ready(RemoteSandbox),
+    Expired,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSnapshot {
+    name: String,
+    pub status: SnapshotStatus,
+    pub error: Option<String>,
+    source_sandbox_id: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+impl SavedSnapshot {
+    pub fn belongs_to(&self, id: &str) -> bool {
+        self.source_sandbox_id
+            .as_deref()
+            .is_none_or(|source| source == id)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotStatus {
+    Saving,
+    Ready,
+    Failed,
+}
+
+#[derive(Deserialize)]
+struct SnapshotResponse {
+    ok: bool,
+    snapshot: SavedSnapshot,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageResponse {
+    ok: bool,
+    sandbox_id: String,
+    sandbox_type: String,
+    seconds: u64,
+    dollars: f64,
+    running: bool,
 }
 
 #[derive(Deserialize)]
@@ -106,18 +154,12 @@ impl Boat {
         Ok(Self { http, base })
     }
 
-    fn request(&self, method: Method, id: Option<&str>, action: Option<&str>) -> RequestBuilder {
+    fn request(&self, method: Method, segments: &[&str]) -> RequestBuilder {
         let mut url = self.base.clone();
-        {
-            let mut path = url.path_segments_mut().expect("validated Boat base URL");
-            path.pop_if_empty().push("sandboxes");
-            if let Some(id) = id {
-                path.push(id);
-            }
-            if let Some(action) = action {
-                path.push(action);
-            }
-        }
+        url.path_segments_mut()
+            .expect("validated Boat base URL")
+            .pop_if_empty()
+            .extend(segments);
         self.http.request(method, url)
     }
 
@@ -138,40 +180,58 @@ impl Boat {
             .with_context(|| format!("invalid Boat {operation} response"))
     }
 
-    pub async fn create(&self, user: &User, ttl: u64) -> Result<RemoteSandbox> {
+    pub async fn create(
+        &self,
+        username: &str,
+        sandbox: &Sandbox,
+        ttl: u64,
+        template: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<RemoteSandbox> {
+        let mut body = json!({
+            "type": sandbox.size, "noEnv": true, "ttlSeconds": ttl,
+            "name": sandbox.alias, "visibility": "private",
+            "labels": {
+                "t3fleet.managed": "true", "t3fleet.user": username, "t3fleet.sandbox": sandbox.name,
+            },
+        });
+        if let Some(template) = template {
+            body["from"] = json!(template);
+        }
         let response = self
-            .request(Method::POST, None, None)
-            .header("Idempotency-Key", &user.id)
-            .json(&json!({
-                "type": user.size, "noEnv": true, "ttlSeconds": ttl,
-                "name": format!("t3fleet-{}", user.username),
-                "labels": { "t3fleet.managed": "true", "t3fleet.user": user.username },
-            }))
+            .request(Method::POST, &["sandboxes"])
+            .header("Idempotency-Key", idempotency_key)
+            .json(&body)
             .send()
             .await
             .context("Boat create request failed")?;
         let payload: SandboxResponse = Self::json(response, "create").await?;
         ensure!(
-            payload.ok && !payload.sandbox.id.is_empty(),
+            payload.ok
+                && !payload.sandbox.id.is_empty()
+                && !payload.sandbox.id.starts_with("pending:"),
             "Boat create failed"
         );
         Ok(payload.sandbox)
     }
 
-    pub async fn get(&self, id: &str) -> Result<RemoteSandbox> {
-        let response = self.request(Method::GET, Some(id), None).send().await?;
+    pub async fn get(&self, id: &str) -> Result<Option<RemoteSandbox>> {
+        let response = self.request(Method::GET, &["sandboxes", id]).send().await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         let payload: SandboxResponse = Self::json(response, "status").await?;
         ensure!(
             payload.ok && payload.sandbox.id == id,
             "invalid Boat sandbox status"
         );
-        Ok(payload.sandbox)
+        Ok(Some(payload.sandbox))
     }
 
     pub async fn wait_for(&self, id: &str, archived: bool) -> Result<RemoteSandbox> {
         tokio::time::timeout(Duration::from_secs(180), async {
             loop {
-                let sandbox = self.get(id).await?;
+                let sandbox = self.get(id).await?.context("Boat sandbox not found")?;
                 if (archived && sandbox.state == "archived") || (!archived && sandbox.running()) {
                     return Ok(sandbox);
                 }
@@ -195,7 +255,7 @@ impl Boat {
 
     pub async fn ttl(&self, id: &str, ttl: u64) -> Result<()> {
         let response = self
-            .request(Method::PATCH, Some(id), None)
+            .request(Method::PATCH, &["sandboxes", id])
             .json(&json!({ "ttlSeconds": ttl }))
             .send()
             .await?;
@@ -205,7 +265,7 @@ impl Boat {
 
     pub async fn request_stop(&self, id: &str) -> Result<()> {
         let response = self
-            .request(Method::POST, Some(id), Some("stop"))
+            .request(Method::POST, &["sandboxes", id, "stop"])
             .json(&json!({ "force": false }))
             .send()
             .await?;
@@ -213,19 +273,99 @@ impl Boat {
         Ok(())
     }
 
-    pub async fn resume(&self, id: &str, ttl: u64) -> Result<RemoteSandbox> {
+    pub async fn resume(&self, id: &str, ttl: u64) -> Result<ResumeOutcome> {
         let response = self
-            .request(Method::POST, Some(id), Some("resume"))
+            .request(Method::POST, &["sandboxes", id, "resume"])
             .json(&json!({ "ttlSeconds": ttl }))
             .send()
             .await?;
-        Self::check(response, "resume").await?;
-        self.wait_for(id, false).await
+        match response.status() {
+            StatusCode::NOT_FOUND => return Ok(ResumeOutcome::Expired),
+            StatusCode::CONFLICT => {
+                let body: Value = response
+                    .json()
+                    .await
+                    .context("invalid Boat resume conflict")?;
+                if error_codes(&body).any(|code| code == "snapshot_data_expired") {
+                    return Ok(ResumeOutcome::Expired);
+                }
+                bail!("Boat resume returned HTTP 409");
+            }
+            _ => {
+                Self::check(response, "resume").await?;
+            }
+        }
+        Ok(ResumeOutcome::Ready(self.wait_for(id, false).await?))
+    }
+
+    pub async fn save_snapshot(&self, id: &str, name: &str) -> Result<()> {
+        let response = self
+            .request(Method::POST, &["saved-snapshots"])
+            .json(&json!({ "sandboxId": id, "name": name }))
+            .send()
+            .await?;
+        if response.status() == StatusCode::CONFLICT
+            && let Some(snapshot) = self.saved_snapshot(name).await?
+            && snapshot.source_sandbox_id.as_deref() == Some(id)
+        {
+            return Ok(());
+        }
+        Self::check(response, "save snapshot").await?;
+        Ok(())
+    }
+
+    pub async fn saved_snapshot(&self, name: &str) -> Result<Option<SavedSnapshot>> {
+        let response = self
+            .request(Method::GET, &["saved-snapshots", name])
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let payload: SnapshotResponse = Self::json(response, "saved snapshot status").await?;
+        ensure!(
+            payload.ok && payload.snapshot.name == name,
+            "invalid Boat saved snapshot status"
+        );
+        Ok(Some(payload.snapshot))
+    }
+
+    pub async fn delete_saved_snapshot(&self, name: &str) -> Result<()> {
+        let response = self
+            .request(Method::DELETE, &["saved-snapshots", name])
+            .send()
+            .await?;
+        if response.status() != StatusCode::NOT_FOUND {
+            Self::check(response, "delete saved snapshot").await?;
+        }
+        Ok(())
+    }
+
+    pub async fn usage(&self, id: &str) -> Result<Option<SandboxUsage>> {
+        let response = self
+            .request(Method::GET, &["sandboxes", id, "usage"])
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let payload: UsageResponse = Self::json(response, "usage").await?;
+        ensure!(
+            payload.ok && payload.sandbox_id == id,
+            "invalid Boat sandbox usage"
+        );
+        Ok(Some(SandboxUsage {
+            sandbox_id: payload.sandbox_id,
+            sandbox_type: payload.sandbox_type,
+            seconds: payload.seconds,
+            dollars: payload.dollars,
+            running: payload.running,
+        }))
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
         let response = self
-            .request(Method::DELETE, Some(id), None)
+            .request(Method::DELETE, &["sandboxes", id])
             .header("X-Ascii-Confirm-Delete", id)
             .send()
             .await?;
@@ -240,21 +380,13 @@ impl Boat {
         let mut delay = Duration::from_millis(250);
         loop {
             let response = self
-                .request(Method::POST, Some(id), Some("sshkey"))
+                .request(Method::POST, &["sandboxes", id, "sshkey"])
                 .json(&json!({ "key": key }))
                 .send()
                 .await?;
             if response.status() == StatusCode::CONFLICT {
                 let body: Value = response.json().await.unwrap_or(Value::Null);
-                let transient = [
-                    body.get("code"),
-                    body.get("error"),
-                    body.pointer("/error/code"),
-                ]
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .any(|code| TRANSIENT_SSH_ERRORS.contains(&code));
+                let transient = error_codes(&body).any(|code| TRANSIENT_SSH_ERRORS.contains(&code));
                 ensure!(
                     transient && Instant::now() < deadline,
                     "Boat SSH authorization returned HTTP 409"
@@ -303,7 +435,7 @@ impl Boat {
 
     pub async fn command(&self, id: &str, command: &str, timeout: u64) -> Result<String> {
         let response = self
-            .request(Method::POST, Some(id), Some("commands"))
+            .request(Method::POST, &["sandboxes", id, "commands"])
             .timeout(Duration::from_secs(timeout + 15))
             .json(&json!({ "command": command, "timeoutSeconds": timeout }))
             .send()
@@ -322,4 +454,15 @@ impl Boat {
         );
         Ok(payload.stdout)
     }
+}
+
+fn error_codes(body: &Value) -> impl Iterator<Item = &str> {
+    [
+        body.get("code"),
+        body.get("error"),
+        body.pointer("/error/code"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
 }
